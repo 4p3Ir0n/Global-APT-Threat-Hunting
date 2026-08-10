@@ -25,7 +25,7 @@ import requests
 
 UTC = dt.timezone.utc
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "30"))
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 USER_AGENT = "Global-APT-Threat-Hunting/1.0 (+https://github.com/4p3Ir0n/Global-APT-Threat-Hunting)"
 HTTP_TIMEOUT = 30
 
