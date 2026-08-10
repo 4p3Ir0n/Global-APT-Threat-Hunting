@@ -2117,3 +2117,105 @@ AuditLogs
 ---
 
 *Generated for internal SOC use. All ATT&CK® references © MITRE Corporation. Hunt responsibly.*
+
+---
+
+## 🤖 Auto-Generated Daily Detections (OSINT-derived)
+
+> ⚠️ **These queries are machine-generated from open-source reporting and are NOT validated.** They are structurally linted only. Review, tune thresholds, confirm table/column names against your schema, and test before deploying to production. Newest entries are appended at the end.
+
+### 2026-08-10
+
+*Generated 2026-08-10 13:51 UTC · model `claude-sonnet-5`*
+
+_Lint: 5 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### TrueConf Server Process Spawning Unexpected Child Processes
+- **Actor / Campaign:** Head Mare (TrueConf exploitation / PhantomCore)
+- **MITRE ATT&CK:** T1210 — Exploitation of Remote Services
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("trueconf", "tconfd", "tcserver") // adjust to actual TrueConf server binary names in your environment
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe","regsvr32.exe","bitsadmin.exe","certutil.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Web-facing conferencing/collaboration servers legitimately spawn few if any shells; validate against a baseline of normal TrueConf server behavior before alerting, and confirm actual TrueConf process/service names in your estate.
+
+#### TrueConf Client Installer File Replaced or Dropped Unexpectedly
+- **Actor / Campaign:** Head Mare (PhantomCore installer swap)
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Compromise Software Supply Chain
+- **Data source:** DeviceFileEvents
+- **Data source:** DeviceFileEvents
+- **Source:** [1]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName endswith ".exe" or FileName endswith ".msi"
+| where FileName has "trueconf" or FolderPath has "trueconf"
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessCommandLine, SHA256
+| take 100
+```
+
+*Note:* Intended to catch server-side installer/client package tampering reported for PhantomCore delivery; tune FolderPath to your actual TrueConf install/distribution paths and expect noise during legitimate patch/update cycles — correlate with unexpected hash changes on known installers.
+
+#### Command-Line Activity from TrueConf Server Account Context
+- **Actor / Campaign:** Head Mare
+- **MITRE ATT&CK:** T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where AccountName has_any ("trueconf","tcserver","svc-trueconf") // service account used to run TrueConf server
+| where FileName in~ ("cmd.exe","powershell.exe","net.exe","whoami.exe","net1.exe","reg.exe")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Requires knowledge of the service account TrueConf server runs under; treat as high-value signal if that account normally never spawns interactive tooling.
+
+#### Outbound Network Connections Initiated by TrueConf Server Process
+- **Actor / Campaign:** Head Mare (post-exploitation C2 to PhantomCore infrastructure)
+- **MITRE ATT&CK:** T1071 — Application Layer Protocol (C2)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("trueconf", "tconfd", "tcserver")
+| where RemotePort in (80, 443, 8080, 4443) // common C2 fallback ports; widen as needed
+| where RemoteIPType == "Public"
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemoteUrl, RemotePort, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* No specific C2 IPs/domains were published in this report; this is a purely behavioral hunt for anomalous outbound connections from the TrueConf server process and requires environment-specific allow-listing of legitimate TrueConf/TURN/STUN traffic to reduce false positives.
+
+#### Persistence Mechanism Created Following TrueConf Server Compromise
+- **Actor / Campaign:** Head Mare (PhantomCore persistence)
+- **MITRE ATT&CK:** T1547.001 — Boot or Logon Autostart Execution: Registry Run Keys / Startup Folder
+- **Data source:** DeviceRegistryEvents, DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceRegistryEvents
+| where Timestamp > ago(30d)
+| where RegistryKey has @"CurrentVersion\Run" or RegistryKey has @"CurrentVersion\RunOnce"
+| where InitiatingProcessFileName has_any ("trueconf", "tconfd", "tcserver")
+| project Timestamp, DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+| take 100
+```
+
+*Note:* Heuristic hunt for persistence dropped by/via the compromised TrueConf server process; validate the actual TrueConf binary name in your build and expect to also check Scheduled Tasks (DeviceProcessEvents on schtasks.exe) as an alternate persistence vector.
+
+> [1] TrueConf Server Flaws Exploited to Replace Client Installers with PhantomCore — https://thehackernews.com/2026/08/head-mare-exploits-trueconf-flaws-to.html
