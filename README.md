@@ -8,7 +8,7 @@ Each day a GitHub Actions workflow aggregates public threat-intel feeds
 (CISA advisories + KEV, vendor research blogs, SANS ISC), filters for
 APT-relevant items, and has Claude synthesize an analyst-style hunting brief.
 
-**Latest brief:** —
+**Latest brief:** reports/2026-08-10.md
 
 ## How it works
 
@@ -17,13 +17,6 @@ APT-relevant items, and has Claude synthesize an analyst-style hunting brief.
 3. The brief is committed as `reports/YYYY-MM-DD.md` and this index is refreshed.
 
 Runs daily via [`.github/workflows/daily-hunt.yml`](.github/workflows/daily-hunt.yml).
-
-## Related: KQL hunting reference
-
-This repo also hosts a hand-maintained **KQL threat-hunting reference** for
-Microsoft Sentinel & Defender XDR covering 50+ APT groups:
-[`Global-APT-Threat-Hunting/global-apt-threat-hunting-kql.md`](Global-APT-Threat-Hunting/global-apt-threat-hunting-kql.md).
-The daily automation above complements it with fresh OSINT.
 
 ## Setup
 
@@ -39,7 +32,7 @@ python hunt.py --dry-run  # fetch + filter only, no API call
 
 ## Report archive
 
-_No reports yet — the first brief appears after the workflow runs._
+- [2026-08-10](reports/2026-08-10.md)
 
 ---
 
