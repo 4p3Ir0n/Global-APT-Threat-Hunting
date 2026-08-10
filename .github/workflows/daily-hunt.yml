@@ -1,0 +1,48 @@
+name: Daily APT Threat Hunt
+
+on:
+  schedule:
+    # 13:17 UTC every day (offset from the top of the hour for reliability).
+    - cron: "17 13 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-hunt
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate threat-hunting brief
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+        run: python hunt.py
+
+      - name: Commit report
+        run: |
+          git config user.name  "apt-hunt-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/ README.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Daily APT threat-hunting brief: $(date -u +%Y-%m-%d)"
+            git push
+          fi
