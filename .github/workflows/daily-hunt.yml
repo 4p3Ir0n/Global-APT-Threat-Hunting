@@ -1,4 +1,4 @@
-name: Daily APT Threat Hunt
+name: Daily APT KQL Detections
 
 on:
   schedule:
@@ -18,10 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -29,20 +29,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate threat-hunting brief
+      - name: Generate candidate KQL detections
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
         run: python hunt.py
 
-      - name: Commit report
+      - name: Commit updated playbook
         run: |
           git config user.name  "apt-hunt-bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports/ README.md
+          git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Daily APT threat-hunting brief: $(date -u +%Y-%m-%d)"
+            git commit -m "Daily APT candidate KQL detections: $(date -u +%Y-%m-%d)"
             git push
           fi
