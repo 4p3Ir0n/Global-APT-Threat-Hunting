@@ -2219,3 +2219,142 @@ DeviceRegistryEvents
 *Note:* Heuristic hunt for persistence dropped by/via the compromised TrueConf server process; validate the actual TrueConf binary name in your build and expect to also check Scheduled Tasks (DeviceProcessEvents on schtasks.exe) as an alternate persistence vector.
 
 > [1] TrueConf Server Flaws Exploited to Replace Client Installers with PhantomCore — https://thehackernews.com/2026/08/head-mare-exploits-trueconf-flaws-to.html
+
+### 2026-08-11
+
+*Generated 2026-08-11 14:32 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### TrueConf Installer Delivering Head Mare Backdoors (PhantomCore/PhantomGraph)
+- **Actor / Campaign:** Head Mare
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Compromise Software Supply Chain
+- **Data source:** DeviceProcessEvents
+- **Source:** [3][11]
+
+```kql
+// Head Mare delivers trojanized TrueConf installers via a compromised/unpatched TrueConf server.
+// Hunt for TrueConf-branded installer/client binaries spawning shells or scripting hosts — atypical for a video-conferencing client.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("TrueConf", "trueconf") 
+    or FileName has_any ("TrueConf", "trueconf")
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","rundll32.exe","mshta.exe","regsvr32.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Legitimate TrueConf updaters may briefly touch the filesystem; validate against known-good installer hash/signature and correlate with TrueConf server exposure/patch level before escalating.
+
+#### Suspicious Outbound Connections from TrueConf Client/Server Processes
+- **Actor / Campaign:** Head Mare
+- **MITRE ATT&CK:** T1210 — Exploitation of Remote Services / T1071 — Application Layer Protocol (C2)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [3][11]
+
+```kql
+// Look for TrueConf server/client processes initiating unexpected outbound connections
+// following exploitation of the reported unpatched TrueConf server vulnerability chain.
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("TrueConf", "trueconf", "TrueConfServer")
+| where RemotePort in (80, 443, 8080, 8443) or RemotePort !in (80,443)
+| where isnotempty(RemoteIP)
+| summarize ConnCount = count(), Ports = make_set(RemotePort), RemoteIPs = make_set(RemoteIP) by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+| where ConnCount > 5
+| take 100
+```
+
+*Note:* No specific C2 IOCs were published; this is a coarse volumetric heuristic — tune baseline connection counts per environment and pivot on RemoteIP reputation/geolocation.
+
+#### StormEncryptor Ransomware — Mass File Renaming to .encrypted
+- **Actor / Campaign:** Storm-1175 (former Medusa affiliate)
+- **MITRE ATT&CK:** T1486 — Data Encrypted for Impact
+- **Data source:** DeviceFileEvents
+- **Source:** [7][8]
+
+```kql
+// StormEncryptor (C++, Storm-1175) appends the .encrypted extension to encrypted files.
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName endswith ".encrypted"
+| summarize FilesTouched = count(), Folders = make_set(FolderPath, 20) by DeviceId, DeviceName, bin(Timestamp, 5m)
+| where FilesTouched > 30
+| order by FilesTouched desc
+| take 100
+```
+
+*Note:* High-volume rename/write bursts ending in `.encrypted` are a strong ransomware indicator, but confirm the extension against final reporting/IR notes — some backup or archival tools use similar suffixes.
+
+#### Possible N-central RMM Abuse Preceding StormEncryptor Deployment
+- **Actor / Campaign:** Storm-1175
+- **MITRE ATT&CK:** T1219 — Remote Access Software / T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+// Microsoft assesses StormEncryptor was likely delivered via an N-central (N-able) RMM flaw.
+// Flag N-central agent processes spawning shells, script hosts, or LOLBins.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("ncentral", "N-central", "BASupSrvc", "winagent")
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe","rundll32.exe","certutil.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Legitimate RMM scripting is common; baseline expected automation scripts for your N-central deployment and alert only on deviations (unusual command lines, new hosts, off-hours execution).
+
+#### WordPress Admin User Created Immediately After Remote JSON Feed Fetch (BdThemes-style Supply Chain)
+- **Actor / Campaign:** Unattributed (BdThemes plugin supply-chain compromise)
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise / T1136.001 — Create Account: Local Account
+- **Data source:** W3CIISLog (or equivalent web server log table ingested via AMA)
+- **Source:** [5][6]
+
+```kql
+// BdThemes plugins fetched a poisoned remote JSON feed that silently created rogue wp-admin accounts
+// in the admin's browser session — no repo files were modified, so hunt web-server access logs instead.
+W3CIISLog
+| where TimeGenerated > ago(14d)
+| where csUriStem has_any ("wp-admin/user-new.php", "wp-admin/admin-ajax.php")
+| where csMethod == "POST"
+| summarize RequestCount = count(), URIs = make_set(csUriStem) by cIP, sSiteName, bin(TimeGenerated, 10m)
+| where RequestCount > 0
+| join kind=inner (
+    W3CIISLog
+    | where TimeGenerated > ago(14d)
+    | where csUriStem has "wp-json" or csUriStem has ".json"
+) on sSiteName
+| project TimeGenerated, cIP, sSiteName, csUriStem, RequestCount
+| take 100
+```
+
+*Note:* This is a heuristic scaffold — column names/log source vary widely by hosting stack (IIS vs Apache vs managed WAF logs). Prefer correlating with WordPress `wp_users`/`wp_usermeta` audit logs or a security plugin's activity log if available; treat as a starting point for tuning, not a ready-made rule.
+
+#### Local/Offline LLM Runtime Execution on Endpoints (Kimsuky Offline AI Stack Heuristic)
+- **Actor / Campaign:** Kimsuky
+- **MITRE ATT&CK:** T1588.007 — Obtain Capabilities: Artificial Intelligence / T1105 — Ingress Tool Transfer
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [10]
+
+```kql
+// Genians reports Kimsuky now runs AI models offline on its own infrastructure and builds AI capability
+// into malware/phishing tooling. No IOCs published; hunt for unexpected local LLM runtimes on endpoints
+// (dev/test hosts, RAG/document-search tools) that could indicate staging of such capability.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any ("ollama.exe","llama-server.exe","llama.cpp","gpt4all.exe","text-generation-webui","lmstudio.exe","koboldcpp.exe")
+| where InitiatingProcessFileName !in~ ("explorer.exe") // exclude obvious deliberate user launches; tune per org
+| project Timestamp, DeviceName, AccountName, FileName, FolderPath, InitiatingProcessFileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Purely behavioral/heuristic — legitimate AI/dev workstations will trigger this; scope to servers, non-dev endpoints, or hosts with no business justification for local LLM tooling, and correlate with known Kimsuky delivery vectors (spearphishing, LNK/HWP lures) when investigating hits.
+
+> [3] Head Mare APT is exploiting vulnerabilities in an unpatched TrueConf server to deliver PhantomCore and PhantomGraph to video conference participants — https://securelist.com/tr/head-mare-targets-trueconf-server-with-phantomcore/120988/
+> [5] BdThemes Supply Chain Attack Poisons JSON to Create Rogue WordPress Admins — https://thehackernews.com/2026/08/bdthemes-supply-chain-attack-poisons.html
+> [6] BdThemes plugins supply-chain hack creates rogue WordPress admins — https://www.bleepingcomputer.com/news/security/bdthemes-plugins-supply-chain-hack-creates-rogue-wordpress-admins/
+> [7] New StormEncryptor ransomware used by former Medusa affiliate — https://www.bleepingcomputer.com/news/security/new-stormencryptor-ransomware-used-by-former-medusa-affiliate/
+> [8] China-Linked Hackers Deploy New StormEncryptor Ransomware, Likely via N-central Flaw — https://thehackernews.com/2026/08/china-linked-hackers-deploy-new.html
+> [10] Kimsuky Builds Offline AI Stack to Boost Phishing and Automate Malware Development — https://thehackernews.com/2026/08/kimsuky-builds-offline-ai-stack-that.html
+> [11] TrueConf Server Flaws Exploited to Replace Client Installers with PhantomCore — https://thehackernews.com/2026/08/head-mare-exploits-trueconf-flaws-to.html
