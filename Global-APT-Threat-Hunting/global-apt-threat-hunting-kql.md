@@ -2358,3 +2358,214 @@ DeviceProcessEvents
 > [8] China-Linked Hackers Deploy New StormEncryptor Ransomware, Likely via N-central Flaw — https://thehackernews.com/2026/08/china-linked-hackers-deploy-new.html
 > [10] Kimsuky Builds Offline AI Stack to Boost Phishing and Automate Malware Development — https://thehackernews.com/2026/08/kimsuky-builds-offline-ai-stack-that.html
 > [11] TrueConf Server Flaws Exploited to Replace Client Installers with PhantomCore — https://thehackernews.com/2026/08/head-mare-exploits-trueconf-flaws-to.html
+
+### 2026-08-12
+
+*Generated 2026-08-12 14:33 UTC · model `claude-sonnet-5`*
+
+_Lint: 9 KQL block(s) — query 9: unbalanced '()'. All queries are CANDIDATES; validate before use._
+
+#### Suspicious SYSTEM-level process spawn following Defender component activity (ShieldBreak / RoguePlanet)
+- **Actor / Campaign:** Nightmare Eclipse (Chaotic Eclipse / INFINITE NIGHTMARE / MSNightmare)
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents
+- **Source:** [1][5]
+
+```kql
+// Behavioral: ShieldBreak is a PoC patch bypass for CVE-2026-50656 (RoguePlanet) that elevates
+// arbitrary processes to SYSTEM via a Defender component. No public IOCs (file names/hashes) exist yet,
+// so hunt for low-privilege processes suddenly spawning SYSTEM children shortly after touching
+// Defender/MsMpEng-related binaries or services.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("MsMpEng.exe", "MpCmdRun.exe", "NisSrv.exe", "MsSense.exe")
+   or ProcessCommandLine has_any ("MsMpEng", "RoguePlanet", "ShieldBreak")
+| where AccountName has_any ("system", "SYSTEM") or ProcessTokenElevation == "TokenElevationTypeFull"
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* No confirmed IOCs are public for ShieldBreak; this is a coarse behavioral hunt to be tuned once a PoC/binary sample or specific technique (e.g., named pipe, driver name) is disclosed. Expect noise from legitimate Defender maintenance tasks — validate against AV/EDR update windows.
+
+#### VMware vCenter directory traversal exploitation attempts (CVE-2026-59310)
+- **Actor / Campaign:** unattributed (reported by QUIRSO)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog, DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+// Hunt for directory-traversal patterns aimed at vCenter server (CVE-2026-59310, CVSS 9.8).
+// Assumes vCenter access/HTTP logs forwarded via CEF/Syslog into CommonSecurityLog.
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor has "VMware" or Application has "vcenter"
+| where RequestURL has_any ("../", "..%2f", "..%252f", "%2e%2e%2f")
+| project TimeGenerated, DeviceVendor, SourceIP, DestinationIP, RequestURL, DeviceAction
+| take 100
+```
+
+*Note:* Table/field names depend on how vCenter logs are ingested (CEF vs custom connector); adjust `Application`/`RequestURL` mapping. Also monitor for post-exploitation persistence such as new local accounts or SSH key changes on vCenter appliances.
+
+#### Credential file access followed by outbound connection after LiteLLM/pip install (supply-chain credential theft)
+- **Actor / Campaign:** unattributed (Trivy-linked PyPI compromise, reported by CloudSEK)
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Compromised Software Dependencies; T1552.001 — Credentials In Files
+- **Data source:** DeviceProcessEvents, DeviceFileEvents, DeviceNetworkEvents
+- **Source:** [3]
+
+```kql
+// Behavioral hunt: malicious LiteLLM PyPI releases harvested cloud/SSH/K8s/DB secrets shortly after
+// package install (~40 min exposure window on PyPI, March incident). No hashes/IOCs published.
+let cred_paths = dynamic([".aws/credentials", ".ssh/id_rsa", ".kube/config", ".docker/config.json"]);
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FolderPath has_any (cred_paths)
+| where InitiatingProcessFileName has_any ("python", "python3", "pip", "pip3")
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName has_any ("python", "python3", "pip", "pip3")
+) on DeviceId
+| where DeviceNetworkEvents.Timestamp - DeviceFileEvents.Timestamp between (0min .. 10min)
+| project DeviceFileEvents.Timestamp, DeviceName, FolderPath, RemoteIP, RemoteUrl, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Highly heuristic — legitimate DevOps automation (CI/CD pipelines) also reads credential files then makes network calls; tune to exclude known CI runners and pin to the March 2026 exposure window if timestamps are available.
+
+#### Trojanized WireGuard client execution from fake job-offer lures (Sandworm / UAC-0145)
+- **Actor / Campaign:** Sandworm (APT44) / UAC-0145
+- **MITRE ATT&CK:** T1204.002 — User Execution: Malicious File; T1071.001 — Application Layer Protocol: Web Protocols; T1059.003 — Command and Scripting Interpreter: Windows Command Shell
+- **Data source:** DeviceProcessEvents, DeviceFileEvents, EmailEvents
+- **Source:** [7][9]
+
+```kql
+// Sandworm subgroup UAC-0145 lures IT admins/sysadmins with fake job interviews to install a
+// trojanized WireGuard VPN client capable of executing arbitrary commands.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any ("wireguard", "wg-quick", "wireguard-installer")
+| where InitiatingProcessFileName has_any ("winword.exe", "outlook.exe", "chrome.exe", "msedge.exe", "explorer.exe")
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName in~ ("cmd.exe", "powershell.exe")
+) on DeviceId
+| where DeviceProcessEvents1.Timestamp - DeviceProcessEvents.Timestamp between (0min .. 15min)
+| where DeviceProcessEvents1.InitiatingProcessFileName has_any ("wireguard", "wg-quick")
+| project DeviceProcessEvents.Timestamp, DeviceName, FileName, ProcessCommandLine=DeviceProcessEvents1.ProcessCommandLine
+| take 100
+```
+
+*Note:* No file hashes/domains were published in the source; this hunts the behavioral pattern (VPN installer spawning a command shell). Expect false positives from legitimate WireGuard deployments that use post-install scripts — validate against known-good installer hashes if available.
+
+#### Recruiter-themed phishing attachments delivering VPN/backdoor installers
+- **Actor / Campaign:** Sandworm / UAC-0145
+- **MITRE ATT&CK:** T1566.001 — Phishing: Spearphishing Attachment
+- **Data source:** EmailEvents, EmailAttachmentInfo
+- **Source:** [7][9]
+
+```kql
+// CERT-UA reports fake recruiter/job-interview themed emails targeting IT/sysadmin staff to deliver
+// a malicious VPN client. Hunt for job-offer themed subjects with executable/archive attachments.
+EmailEvents
+| where Timestamp > ago(30d)
+| where SenderFromAddress !endswith "@yourcorp.com" // exclude legit internal HR
+| where Subject has_any ("job offer", "interview", "vacancy", "career opportunity", "position")
+| join kind=inner (
+    EmailAttachmentInfo
+    | where FileType in~ ("exe", "zip", "rar", "msi", "iso")
+) on NetworkMessageId
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject, FileName, FileType
+| take 100
+```
+
+*Note:* Tune subject keyword list to local language variants (Ukrainian/Russian) and integrate with attachment sandboxing; this is a coarse lure-theme hunt, not a malware signature.
+
+#### TrueConf server exploitation delivering PhantomCore/PhantomGraph backdoor (Head Mare)
+- **Actor / Campaign:** Head Mare APT
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1204.002 — User Execution: Malicious File
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [15]
+
+```kql
+// Head Mare exploits an unpatched TrueConf video conferencing server to push trojanized TrueConf
+// installers delivering PhantomCore/PhantomGraph backdoors to meeting participants.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any ("trueconf", "TrueConf_Setup", "trueconf-installer")
+| where InitiatingProcessFileName has_any ("chrome.exe", "msedge.exe", "firefox.exe", "explorer.exe")
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+```kql
+// Complement: look for post-install beaconing shortly after TrueConf install (potential PhantomCore/PhantomGraph C2).
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("trueconf", "TrueConf")
+| where RemotePort in (443, 8443, 8080) 
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* No hashes/domains were disclosed in the summary; these are process/network-lineage heuristics tied to the "TrueConf installer" delivery vector. Validate installer file hash/signature against Kaspersky's IOC list once published.
+
+#### Windows AFD/WinSock use-after-free exploitation attempt (CVE-2026-68820, KEV)
+- **Actor / Campaign:** unattributed (actively exploited, in CISA KEV)
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents, DeviceImageLoadEvents
+- **Source:** [8][10][11][17][20]
+
+```kql
+// CVE-2026-68820: UAF in afd.sys (Ancillary Function Driver for WinSock), used for local privilege
+// escalation to SYSTEM. Hunt for unusual non-system processes loading afd.sys followed by a
+// SYSTEM-level child process (classic LPE pattern).
+DeviceImageLoadEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "afd.sys"
+| where InitiatingProcessFileName !in~ ("services.exe", "svchost.exe", "System", "lsass.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessId, FolderPath
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where AccountName has "system"
+) on DeviceId
+| where DeviceProcessEvents.Timestamp - Timestamp between (0min .. 5min)
+| project Timestamp, DeviceName, InitiatingProcessFileName, ElevatedProcess=DeviceProcessEvents.FileName, DeviceProcessEvents.ProcessCommandLine
+| take 100
+```
+
+*Note:* This is a generic LPE-via-driver pattern; afd.sys is loaded by many legitimate networking components, so expect false positives — prioritize alerts where the initiating process is unsigned, unusual, or user-writable-path based.
+
+#### Metabase SQL injection exploitation attempt (CVE-2026-72898, KEV)
+- **Actor / Campaign:** unattributed (actively exploited, in CISA KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1552 — Unsecured Credentials (post-exploit config/credential theft)
+- **Data source:** CommonSecurityLog, AzureDiagnostics (web app logs)
+- **Source:** [17][21]
+
+```kql
+// CVE-2026-72898: unauthenticated SQLi in Metabase leading to admin takeover.
+// Hunt web-tier logs for SQLi patterns aimed at Metabase API endpoints.
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where RequestURL has "metabase" or RequestURL has_any ("/api/card", "/api/dataset", "/api/setting")
+| where RequestURL has_any ("union select", "or 1=1", "--", "waitfor delay", "sleep(")
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, DeviceAction
+| take 100
+```
+
+*Note:* Adjust field/table mapping to your actual reverse-proxy or WAF log source (e.g., AzureDiagnostics for App Gateway/Front Door); this is a generic SQLi-pattern hunt, not Metabase-specific payload matching. Follow up any hits with a check for new/unexpected admin accounts in Metabase.
+
+> [1] New Microsoft Defender 'ShieldBreak' zero-day grants SYSTEM privileges — https://www.bleepingcomputer.com/news/security/new-microsoft-defender-shieldbreak-zero-day-grants-system-privileges/
+> [2] Attackers Exploit VMware vCenter Vulnerability to Gain Persistent Remote Access — https://thehackernews.com/2026/08/attackers-exploit-vmware-vcenter.html
+> [3] Malicious LiteLLM Releases Tied to Trivy Hack May Have Exposed 2,100+ Organizations — https://thehackernews.com/2026/08/malicious-litellm-releases-tied-to.html
+> [5] ShieldBreak Zero-Day PoC Claims Microsoft Defender Patch Bypass With SYSTEM Access — https://thehackernews.com/2026/08/shieldbreak-zero-day-poc-claims.html
+> [7] Sandworm hackers target IT pros with trojanized WireGuard VPN client — https://www.bleepingcomputer.com/news/security/sandworm-hackers-target-it-pros-with-trojanized-wireguard-vpn-client/
+> [8] Microsoft Patches 398 Flaws Including a Windows Driver Zero-Day Under Active Attack — https://thehackernews.com/2026/08/microsoft-patches-398-flaws-including.html
+> [9] Sandworm-Linked UAC-0145 Uses Fake Job Interviews to Push VPN That Can Run Commands — https://thehackernews.com/2026/08/sandworm-linked-uac-0145-uses-fake-job.html
+> [10] Microsoft August 2026 Patch Tuesday fixes 400 flaws, 3 zero-days — https://www.bleepingcomputer.com/news/microsoft/microsoft-august-2026-patch-tuesday-fixes-400-flaws-3-zero-days/
+> [11] Microsoft Patch Tuesday August 2026 — https://isc.sans.edu/diary/rss/33236
+> [15] Head Mare APT is exploiting vulnerabilities in an unpatched TrueConf server to deliver PhantomCore and PhantomGraph — https://securelist.com/tr/head-mare-targets-trueconf-server-with-phantomcore/120988/
+> [17] CISA Adds Three Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/11/cisa-adds-three-known-exploited-vulnerabilities-catalog
+> [20] CVE-2026-68820 — Microsoft Windows Ancillary Function Driver for WinSock — https://nvd.nist.gov/vuln/detail/CVE-2026-68820
+> [21] CVE-2026-72898 — Metabase SQL Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-72898
