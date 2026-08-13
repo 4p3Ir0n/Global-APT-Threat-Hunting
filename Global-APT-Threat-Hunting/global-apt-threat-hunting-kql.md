@@ -2569,3 +2569,162 @@ CommonSecurityLog
 > [17] CISA Adds Three Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/11/cisa-adds-three-known-exploited-vulnerabilities-catalog
 > [20] CVE-2026-68820 — Microsoft Windows Ancillary Function Driver for WinSock — https://nvd.nist.gov/vuln/detail/CVE-2026-68820
 > [21] CVE-2026-72898 — Metabase SQL Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-72898
+
+### 2026-08-13
+
+*Generated 2026-08-13 14:34 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Suspicious Telegram tdata Access/Exfiltration (Armored Likho Still Toolkit)
+- **Actor / Campaign:** Armored Likho / Still Toolkit
+- **MITRE ATT&CK:** T1005 — Data from Local System / T1560 — Archive Collected Data
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has @"\Telegram Desktop\tdata"
+   or FolderPath has @"\AppData\Roaming\Telegram Desktop"
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where InitiatingProcessFileName !in~ ("Telegram.exe","telegram.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, FolderPath, ActionType
+| take 100
+```
+
+*Note:* Flags non-Telegram processes touching Telegram session/data folders (a hallmark of Telegram-data-stealing toolkits like Still Toolkit). Tune out legitimate backup/sync tools; requires correlation with process reputation.
+
+#### Fundraising/Charity-Themed Lure Leading to Self-Extracting Archive Execution
+- **Actor / Campaign:** Armored Likho / Still Toolkit
+- **MITRE ATT&CK:** T1566.001 — Phishing: Spearphishing Attachment; T1204.002 — User Execution: Malicious File
+- **Data source:** EmailEvents, DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("winrar.exe","7z.exe","7zG.exe") 
+   or FileName has_any (".sfx.exe", "self-extract")
+| where ProcessCommandLine has_any ("charity","fund","donation","fundraising","благотвор","сбор")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Heuristic string match on charity/fundraising themes seen in the campaign lure; expect low volume but tune keyword list to observed language localization once samples are shared publicly.
+
+#### SharePoint w3wp.exe Spawning Command Interpreters (Possible CVE-2026-55040 Exploitation)
+- **Actor / Campaign:** Unattributed — post-PoC mass exploitation of SharePoint auth bypass
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "w3wp.exe"
+| where InitiatingProcessCommandLine has "SharePoint" or InitiatingProcessFolderPath has @"\SharePoint"
+| where FileName in~ ("cmd.exe","powershell.exe","powershell_ise.exe","cscript.exe","wscript.exe","w3wp.exe")
+| where ProcessCommandLine has_any ("whoami","IEX","DownloadString","-enc","Invoke-Expression","Add-Type")
+| project Timestamp, DeviceName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* CVE-2026-55040 is an auth-bypass, so exploitation typically leads to webshell drop/command execution under the SharePoint app pool identity; verify against known ToolShell-style aspx drops (e.g., spinstall*.aspx) via DeviceFileEvents on the LAYOUTS folder as a companion query. No public IOCs in the source, so this is behavioral.
+
+#### SharePoint LAYOUTS Folder Web Shell Drop
+- **Actor / Campaign:** Unattributed — post-PoC mass exploitation of SharePoint auth bypass
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceFileEvents
+- **Source:** [2]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath has @"\Microsoft Shared\Web Server Extensions" and FolderPath has @"\LAYOUTS"
+| where FileName endswith ".aspx"
+| where ActionType == "FileCreated"
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* New .aspx files created in the LAYOUTS directory outside of patch/deployment windows is a strong indicator of webshell staging post-exploitation; validate against change-management records to reduce FPs.
+
+#### SYSTEM-Level Process Spawned Shortly After Windows Privilege Escalation (Lazarus / Operation Dream Job, CVE-2026-68820)
+- **Actor / Campaign:** Lazarus Group — Operation Dream Job
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation; T1543.003 — Create or Modify System Process: Windows Service
+- **Data source:** DeviceProcessEvents, DeviceEvents
+- **Source:** [3],[4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where AccountName has_any ("SYSTEM","LOCAL SERVICE","NETWORK SERVICE")
+| where InitiatingProcessFileName in~ ("winword.exe","excel.exe","powershell.exe","rundll32.exe","mshta.exe","cscript.exe")
+| where FileName in~ ("cmd.exe","powershell.exe","rundll32.exe","svchost.exe","regsvr32.exe")
+| where isnotempty(InitiatingProcessParentFileName)
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Highly heuristic — looks for office/scripting processes that unexpectedly spawn SYSTEM-level children, consistent with local privilege escalation to deploy a new backdoor observed in defense/aerospace targeting (France, Germany, Brazil, India). No file/hash IOCs published yet; correlate with new/rare parent-child chains and lure documents referencing job offers.
+
+#### Job-Offer Lure Document Chain (ISO/LNK Execution) — Operation Dream Job Pattern
+- **Actor / Campaign:** Lazarus Group — Operation Dream Job
+- **MITRE ATT&CK:** T1566.001 — Spearphishing Attachment; T1204.002 — User Execution
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [3],[4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("explorer.exe")
+| where FileName in~ ("cmd.exe","powershell.exe","mshta.exe","wscript.exe","rundll32.exe")
+| where InitiatingProcessCommandLine has_any (".iso",".lnk",".img")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Operation Dream Job historically relies on ISO/LNK-based delivery from recruiting-themed lures; this is a generic pattern-match to surface candidate chains, since no file names/hashes were published for this specific zero-day wave.
+
+#### Anomalous Child Process from Microsoft Defender Binaries (Possible ShieldBreak / CVE Exploitation)
+- **Actor / Campaign:** Nightmare Eclipse — ShieldBreak Defender zero-day
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents
+- **Source:** [5]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("MsMpEng.exe","MpCmdRun.exe","NisSrv.exe","MpDefenderCoreService.exe")
+| where FileName !in~ ("MsMpEng.exe","MpCmdRun.exe","NisSrv.exe")
+| where AccountName has "SYSTEM"
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Defender core services rarely spawn arbitrary child processes; any unexpected child process running as SYSTEM warrants investigation as a candidate for the newly disclosed "ShieldBreak" local-privesc exploit. Baseline against normal Defender scan/update activity to cut noise.
+
+#### Directory-Traversal Style Requests to VMware vCenter (CVE-2026-59310)
+- **Actor / Campaign:** Unattributed — active exploitation per QUIRSO
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1133 — External Remote Services
+- **Data source:** CommonSecurityLog, Syslog, DeviceNetworkEvents
+- **Source:** [6]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(7d)
+| where DeviceProduct has_any ("vCenter","VMware") or Activity has "vsphere"
+| where RequestURL has_any ("..%2f", "../", "..%5c", "..\\")
+| project TimeGenerated, DeviceName, SourceIP, DestinationIP, RequestURL, Activity
+| take 100
+```
+
+*Note:* Query assumes vCenter access/HTTP logs are forwarded to Sentinel via CEF/Syslog; adjust `DeviceProduct`/field names to your actual log source connector (e.g., Apache/Envoy proxy logs on vCenter appliance). No IOC list was published, so match is purely on the CVE's directory-traversal technique; expect tuning against legitimate encoded-path traffic.
+
+> [1] Armored Likho expands its cyber-espionage toolkit — https://securelist.com/armored-likho-still-toolkit/121033/
+> [2] Attackers Exploit SharePoint Authentication Bypass After Public PoC Release — https://thehackernews.com/2026/08/attackers-exploit-sharepoint.html
+> [3] Lazarus Exploits Windows Zero-Day to Gain SYSTEM Access and Deploy Backdoor — https://thehackernews.com/2026/08/lazarus-exploits-windows-zero-day-to.html
+> [4] Lazarus hackers exploited Windows zero-day to target defense firms — https://www.bleepingcomputer.com/news/security/lazarus-hackers-exploited-windows-zero-day-to-target-defense-firms/
+> [5] New Microsoft Defender 'ShieldBreak' zero-day grants SYSTEM privileges — https://www.bleepingcomputer.com/news/security/new-microsoft-defender-shieldbreak-zero-day-grants-system-privileges/
+> [6] Attackers Exploit VMware vCenter Vulnerability to Gain Persistent Remote Access — https://thehackernews.com/2026/08/attackers-exploit-vmware-vcenter.html
