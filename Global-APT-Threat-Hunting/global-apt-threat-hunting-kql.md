@@ -2728,3 +2728,127 @@ CommonSecurityLog
 > [4] Lazarus hackers exploited Windows zero-day to target defense firms — https://www.bleepingcomputer.com/news/security/lazarus-hackers-exploited-windows-zero-day-to-target-defense-firms/
 > [5] New Microsoft Defender 'ShieldBreak' zero-day grants SYSTEM privileges — https://www.bleepingcomputer.com/news/security/new-microsoft-defender-shieldbreak-zero-day-grants-system-privileges/
 > [6] Attackers Exploit VMware vCenter Vulnerability to Gain Persistent Remote Access — https://thehackernews.com/2026/08/attackers-exploit-vmware-vcenter.html
+
+### 2026-08-14
+
+*Generated 2026-08-14 14:20 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Suspicious kernel driver service creation (possible CoolClient rootkit)
+- **Actor / Campaign:** HoneyMyte
+- **MITRE ATT&CK:** T1014 — Rootkit / T1543.003 — Create or Modify System Process: Windows Service
+- **Data source:** DeviceRegistryEvents, DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// New kernel-mode driver service registered outside standard driver install flow (e.g. via sc.exe/reg.exe, not pnputil/msiexec)
+DeviceRegistryEvents
+| where Timestamp > ago(14d)
+| where RegistryKey has @"SYSTEM\CurrentControlSet\Services\"
+  and RegistryValueName =~ "Type"
+  and RegistryValueData in ("1","2") // SERVICE_KERNEL_DRIVER / SERVICE_FILE_SYSTEM_DRIVER
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ ("sc.exe","reg.exe")
+    | where ProcessCommandLine has_any ("create", "add") and ProcessCommandLine has "type= kernel"
+) on DeviceId
+| project Timestamp, DeviceId, RegistryKey, InitiatingProcessAccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Legitimate driver installs (AV/EDR agents, VPN clients) will also trigger this; baseline known driver publishers and filter on unsigned or newly-seen driver names/paths before alerting.
+
+#### Unsigned .sys file dropped to drivers folder by non-installer process
+- **Actor / Campaign:** HoneyMyte
+- **MITRE ATT&CK:** T1014 — Rootkit, T1027 — Obfuscated Files or Information
+- **Data source:** DeviceFileEvents
+- **Source:** [1]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has @"\Windows\System32\drivers\"
+| where FileName endswith ".sys"
+| where InitiatingProcessFileName !in~ ("TrustedInstaller.exe","MsiExec.exe","pnputil.exe","drvinst.exe","svchost.exe")
+| where isnotempty(SHA256)
+| project Timestamp, DeviceId, FileName, FolderPath, InitiatingProcessFileName, InitiatingProcessAccountName, SHA256
+| take 100
+```
+
+*Note:* No hashes/names for the new CoolClient driver were published; hunt is behavioral and needs SHA256 reputation/signing checks to cut noise from legitimate third-party drivers.
+
+#### Webshell-style child process spawned from webmail/IIS worker process
+- **Actor / Campaign:** Jewelbug
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell, T1071.001 — Web Protocols
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("w3wp.exe","umworkerprocess.exe","MSExchangeMailboxAssistants.exe","hostcontrollerservice.exe")
+| where FileName in~ ("cmd.exe","powershell.exe","cscript.exe","wscript.exe","certutil.exe","whoami.exe","net.exe")
+| project Timestamp, DeviceId, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Common webshell-post-compromise pattern for OWA/Exchange/webmail compromises; tune process/account allow-lists for legitimate admin scripts running under IIS app pools.
+
+#### Post-compromise outbound connection to cryptocurrency-related infrastructure from server tier
+- **Actor / Campaign:** Jewelbug
+- **MITRE ATT&CK:** T1071 — Application Layer Protocol, T1657 — Financial Theft
+- **Data source:** DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+// No specific crypto-fraud IOCs published; heuristic for webmail/edge servers making outbound calls to wallet/exchange-style domains
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("w3wp.exe","MSExchangeMailboxAssistants.exe","hostcontrollerservice.exe")
+| where RemoteUrl has_any ("wallet","exchange","swap","binance","coin","crypto") // heuristic keyword match, tune per environment
+| project Timestamp, DeviceId, InitiatingProcessFileName, RemoteUrl, RemoteIP, RemotePort
+| take 100
+```
+
+*Note:* Highly heuristic — no confirmed domains/wallets in source; expect false positives from legitimate finance apps, use as a pivot alongside webshell/process alerts, not standalone.
+
+#### Registry hive load/unload from non-standard process (possible LegacyHive exploitation)
+- **Actor / Campaign:** unattributed (LegacyHive zero-day, CVE not yet numbered in source)
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation, T1112 — Modify Registry
+- **Data source:** DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "reg.exe"
+| where ProcessCommandLine has_any ("load","unload")
+| where InitiatingProcessFileName !in~ ("services.exe","userinit.exe","winlogon.exe")
+| project Timestamp, DeviceId, AccountName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* "LegacyHive" details are limited to a patched Windows zero-day; this looks for anomalous manual hive load/unload activity that could indicate exploitation attempts pre/post-patch — expect FPs from legitimate profile/backup tooling, tune against baseline admin scripts.
+
+#### Unexpected crash of registry/session subsystem processes (possible LegacyHive exploit attempt)
+- **Actor / Campaign:** unattributed (LegacyHive)
+- **MITRE ATT&CK:** T1499 — Endpoint Denial of Service / T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceEvents (or SecurityEvent for Application/System crash logs, Event ID 1000/1001)
+- **Source:** [3]
+
+```kql
+SecurityEvent
+| where TimeGenerated > ago(14d)
+| where EventID in (1000,1001) // Application Error / WER report
+| where Process has_any ("lsass.exe","services.exe","svchost.exe","winlogon.exe")
+| project TimeGenerated, Computer, Process, EventID, RenderedDescription
+| take 100
+```
+
+*Note:* Application/system event log crash telemetry may need to be forwarded via AMA/Log Analytics; correlate crash spikes on patched vs. unpatched systems around the July 2026 Patch Tuesday timeframe to spot pre-patch exploitation.
+
+> [1] APT group HoneyMyte upgrades CoolClient: the backdoor gets a kernel-level Windows rootkit — https://securelist.com/honeymyte-coolclient-driver-rootkit/121028/
+> [2] Hackers breach govt webmail while running parallel crypto fraud — https://www.bleepingcomputer.com/news/security/hackers-breach-govt-webmail-while-running-parallel-crypto-fraud/
+> [3] Microsoft patches LegacyHive Windows zero-day vulnerability — https://www.bleepingcomputer.com/news/microsoft/microsoft-patches-legacyhive-windows-zero-day-vulnerability/
