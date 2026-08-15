@@ -2852,3 +2852,106 @@ SecurityEvent
 > [1] APT group HoneyMyte upgrades CoolClient: the backdoor gets a kernel-level Windows rootkit — https://securelist.com/honeymyte-coolclient-driver-rootkit/121028/
 > [2] Hackers breach govt webmail while running parallel crypto fraud — https://www.bleepingcomputer.com/news/security/hackers-breach-govt-webmail-while-running-parallel-crypto-fraud/
 > [3] Microsoft patches LegacyHive Windows zero-day vulnerability — https://www.bleepingcomputer.com/news/microsoft/microsoft-patches-legacyhive-windows-zero-day-vulnerability/
+
+### 2026-08-15
+
+*Generated 2026-08-15 13:43 UTC · model `claude-sonnet-5`*
+
+_Lint: 5 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+_No concrete IOCs (hashes, file names, paths, C2 domains/IPs) were published in this item, so the detections below are behavioral, built around the described kernel-rootkit driver capability of CoolClient (HoneyMyte)._
+
+#### Kernel driver service creation via command-line tools
+- **Actor / Campaign:** HoneyMyte / CoolClient
+- **MITRE ATT&CK:** T1543.003 — Create or Modify System Process: Windows Service
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("sc.exe","reg.exe","rundll32.exe","cmd.exe","powershell.exe")
+| where ProcessCommandLine has_any ("create", "New-Service") 
+    and ProcessCommandLine has_any ("type= kernel","type=kernel","binPath")
+| where ProcessCommandLine has_any (".sys")
+| project Timestamp, DeviceName, InitiatingProcessAccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Kernel-mode driver services created outside of legitimate software installers are rare; validate against known EDR/AV/hardware driver installs and baseline before alerting.
+
+#### Suspicious unsigned kernel driver image load
+- **Actor / Campaign:** HoneyMyte / CoolClient
+- **MITRE ATT&CK:** T1014 — Rootkit
+- **Data source:** DeviceImageLoadEvents, DeviceFileCertificateInfo
+- **Source:** [1]
+
+```kql
+DeviceImageLoadEvents
+| where Timestamp > ago(30d)
+| where FileName endswith ".sys"
+| where FolderPath has_any (@"\Windows\Temp\", @"\AppData\", @"\ProgramData\", @"\Users\Public\")
+| join kind=leftouter (
+    DeviceFileCertificateInfo
+    | project SHA1, IsSigned, Signer, Issuer
+) on SHA1
+| where IsSigned == false or isempty(Signer)
+| project Timestamp, DeviceName, FileName, FolderPath, SHA1, IsSigned, Signer
+| take 100
+```
+
+*Note:* Legitimate drivers are almost always signed and load from `\Windows\System32\drivers\`; unsigned .sys files loading from user-writable paths is a strong rootkit indicator but check for dev/test-signed internal software first.
+
+#### Registry persistence for kernel driver service (Type 1)
+- **Actor / Campaign:** HoneyMyte / CoolClient
+- **MITRE ATT&CK:** T1547.006 — Boot or Logon Autostart Execution: Kernel Modules and Extensions
+- **Data source:** DeviceRegistryEvents
+- **Source:** [1]
+
+```kql
+DeviceRegistryEvents
+| where Timestamp > ago(30d)
+| where RegistryKey has @"SYSTEM\CurrentControlSet\Services\"
+| where RegistryValueName =~ "Type"
+| where RegistryValueData in ("1","0x1") // SERVICE_KERNEL_DRIVER
+| project Timestamp, DeviceName, InitiatingProcessAccountName, RegistryKey, RegistryValueName, RegistryValueData, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* High-volume table; correlate with newly created service names not previously seen in your environment and cross-reference with the driver-load and file-drop detections above to reduce noise.
+
+#### Driver (.sys) file dropped outside standard driver directories
+- **Actor / Campaign:** HoneyMyte / CoolClient
+- **MITRE ATT&CK:** T1105 — Ingress Tool Transfer / T1014 — Rootkit
+- **Data source:** DeviceFileEvents
+- **Source:** [1]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName endswith ".sys"
+| where FolderPath !has @"\Windows\System32\drivers\"
+| where FolderPath has_any (@"\Temp\", @"\AppData\", @"\ProgramData\", @"\Users\Public\", @"\Downloads\")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessAccountName, FileName, FolderPath, SHA256
+| take 100
+```
+
+*Note:* Broadly catches any driver file drop outside default OS paths (which is unusual); pivot into process trees and network activity of the dropping process to confirm malicious intent versus legitimate hardware/vendor driver installers.
+
+#### Process or artifact naming referencing CoolClient backdoor
+- **Actor / Campaign:** HoneyMyte / CoolClient
+- **MITRE ATT&CK:** T1027 — Obfuscated Files or Information / T1055 — Process Injection (rootkit-hidden process)
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [1]
+
+```kql
+union DeviceProcessEvents, DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName has "coolclient" or FolderPath has "coolclient" or ProcessCommandLine has "coolclient"
+| project Timestamp, DeviceName, FileName, FolderPath, ProcessCommandLine, SHA256
+| take 100
+```
+
+*Note:* Speculative string match based only on the reported malware family name; the actual on-disk artifact naming used by CoolClient was not disclosed in this reporting, so treat any hits as low-confidence and pivot to full host triage.
+
+> [1] APT group HoneyMyte upgrades CoolClient: the backdoor gets a kernel-level Windows rootkit — https://securelist.com/honeymyte-coolclient-driver-rootkit/121028/
