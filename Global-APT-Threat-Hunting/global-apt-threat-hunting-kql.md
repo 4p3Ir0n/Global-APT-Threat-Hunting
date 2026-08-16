@@ -2955,3 +2955,11 @@ union DeviceProcessEvents, DeviceFileEvents
 *Note:* Speculative string match based only on the reported malware family name; the actual on-disk artifact naming used by CoolClient was not disclosed in this reporting, so treat any hits as low-confidence and pivot to full host triage.
 
 > [1] APT group HoneyMyte upgrades CoolClient: the backdoor gets a kernel-level Windows rootkit — https://securelist.com/honeymyte-coolclient-driver-rootkit/121028/
+
+### 2026-08-16
+
+*Generated 2026-08-16 13:44 UTC · model `claude-sonnet-5`*
+
+_Lint: no KQL blocks detected._
+
+_No APT-relevant open-source items in the collection window; no detections generated._
