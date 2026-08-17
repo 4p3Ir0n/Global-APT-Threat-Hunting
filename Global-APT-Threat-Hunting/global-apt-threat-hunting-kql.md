@@ -2963,3 +2963,125 @@ union DeviceProcessEvents, DeviceFileEvents
 _Lint: no KQL blocks detected._
 
 _No APT-relevant open-source items in the collection window; no detections generated._
+
+### 2026-08-17
+
+*Generated 2026-08-17 13:52 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Suspicious Linux payload download & execution consistent with Mirai-derived botnet (Evooo1Bot)
+- **Actor / Campaign:** Evooo1Bot (unattributed, Mirai-derived)
+- **MITRE ATT&CK:** T1105 — Ingress Tool Transfer
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where OSPlatform == "Linux" or DeviceName has_any ("router","gateway","cam","edge")
+| where FileName in~ ("wget","curl","tftp","busybox")
+| where ProcessCommandLine has_any ("/tmp/", "/var/tmp", "/dev/shm")
+| where ProcessCommandLine has_any ("http://", "https://", "chmod +x", "chmod 777")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Generic Mirai-style "download to /tmp, chmod, execute" pattern — no confirmed sample hash/name was published, so this is behavioral and will need tuning to exclude legitimate IoT management or CI/CD scripts on Linux fleets.
+
+#### Mass outbound telnet/SSH scanning indicative of Mirai-family propagation
+- **Actor / Campaign:** Evooo1Bot (unattributed, Mirai-derived)
+- **MITRE ATT&CK:** T1110 — Brute Force / T1595 — Active Scanning
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(1d)
+| where RemotePort in (23, 2323, 22)
+| where OSPlatform == "Linux"
+| summarize DistinctDestinations = dcount(RemoteIP), Attempts = count() by DeviceName, InitiatingProcessFileName, RemotePort, bin(Timestamp, 1h)
+| where DistinctDestinations > 50
+| order by DistinctDestinations desc
+| take 100
+```
+
+*Note:* Flags edge/IoT-class devices making high-fan-out outbound connections to telnet/SSH ports, consistent with Mirai-style self-propagation and credential brute-forcing; tune thresholds to your network's baseline scanning behavior.
+
+#### Unexpected child process or module load from Windows Defender engine (possible ShieldBreak exploitation, CVE-2026-69414)
+- **Actor / Campaign:** unattributed ("ShieldBreak" zero-day)
+- **MITRE ATT&CK:** T1211 — Exploitation for Defense Evasion / T1562.001 — Impair Defenses
+- **Data source:** DeviceProcessEvents, DeviceImageLoadEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName =~ "MsMpEng.exe"
+| where FileName !in~ ("MpCmdRun.exe", "MsMpEng.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+```kql
+DeviceImageLoadEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName =~ "MsMpEng.exe"
+| where isnotempty(SHA256) and FileName !endswith ".mdb" // filter known Defender content files
+| summarize FirstSeen = min(Timestamp) by DeviceName, FileName, FolderPath, SHA256
+| take 100
+```
+
+*Note:* No technical exploit details were published at time of writing; this hunts for anomalous behavior around the Defender engine process (crashes, unexpected children, unsigned/unknown module loads) as a proxy for exploitation attempts. Expect noise from legitimate Defender updates — validate hashes/signers before escalating.
+
+#### Directory-traversal exploitation attempt against VMware vCenter (CVE-2026-59310)
+- **Actor / Campaign:** Suspected China-nexus APT
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog / Syslog (vCenter/vSphere web logs ingested via AMA or CEF connector)
+- **Source:** [3]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(3d)
+| where DeviceVendor has_any ("VMware","Broadcom") or Activity has_any ("vcenter","vsphere","vpxd")
+| where RequestURL has_any ("../", "..%2f", "%2e%2e%2f", "..\\")
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, DeviceAction, Activity
+| take 100
+```
+
+*Note:* Requires vCenter/vSphere web access logs forwarded to Sentinel; adjust field names to your CEF/Syslog parser. High-fidelity if RequestURL parsing is reliable, but path-traversal strings can also appear in benign traffic — correlate with subsequent process/file activity below.
+
+#### Post-exploitation shell spawned from VMware management processes leading to Babuk-derived ransomware activity
+- **Actor / Campaign:** Suspected China-nexus APT / Babuk-derived ransomware
+- **MITRE ATT&CK:** T1059 — Command and Scripting Interpreter / T1486 — Data Encrypted for Impact
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(3d)
+| where InitiatingProcessFileName has_any ("vmtoolsd", "vami-lighttp", "vsphere-ui", "vpxd")
+| where FileName in~ ("bash","sh","python","python3","perl","curl","wget","openssl")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(3d)
+| where ActionType == "FileCreated"
+| where FileName has_any ("README", "HowToRestore", "ransom", "recover") or FileName endswith ".babuk"
+| summarize FilesCreated = count(), Examples = make_set(FileName, 5) by DeviceName, InitiatingProcessAccountName, bin(Timestamp, 1h)
+| where FilesCreated > 10
+| order by FilesCreated desc
+| take 100
+```
+
+*Note:* No specific ransom-note filename or ransomware sample hash was disclosed in the reporting, so this is behavior-based (unexpected shell activity from vCenter/appliance processes, and bulk creation of ransom-note-like files). Tune against known-good VMware maintenance scripts and admin tooling.
+
+_No detectable technical indicators were found in [4] (SafePal breach) — this is a third-party data exposure with no telemetry-based hunting angle for customer environments._
+
+> [1] Evooo1Bot Linux Botnet Exploits Known Flaws to Turn Edge Devices Into SOCKS5 Proxies — https://thehackernews.com/2026/08/evooo1bot-linux-botnet-exploits-known.html
+> [2] Microsoft working on Defender patch for ShieldBreak zero-day — https://www.bleepingcomputer.com/news/security/microsoft-working-on-defender-patch-for-shieldbreak-zero-day/
+> [3] Suspected China-Nexus Actor Exploits VMware vCenter Flaw, Deploys Babuk-Derived Ransomware — https://thehackernews.com/2026/08/suspected-china-nexus-actor-exploits.html
+> [4] SafePal data breach impacts 39,798 customers, stolen info for sale — https://www.bleepingcomputer.com/news/security/safepal-data-breach-impacts-39-798-customers-stolen-info-for-sale/
