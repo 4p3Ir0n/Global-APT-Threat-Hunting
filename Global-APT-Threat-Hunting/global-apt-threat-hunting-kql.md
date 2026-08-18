@@ -3085,3 +3085,174 @@ _No detectable technical indicators were found in [4] (SafePal breach) — this 
 > [2] Microsoft working on Defender patch for ShieldBreak zero-day — https://www.bleepingcomputer.com/news/security/microsoft-working-on-defender-patch-for-shieldbreak-zero-day/
 > [3] Suspected China-Nexus Actor Exploits VMware vCenter Flaw, Deploys Babuk-Derived Ransomware — https://thehackernews.com/2026/08/suspected-china-nexus-actor-exploits.html
 > [4] SafePal data breach impacts 39,798 customers, stolen info for sale — https://www.bleepingcomputer.com/news/security/safepal-data-breach-impacts-39-798-customers-stolen-info-for-sale/
+
+### 2026-08-18
+
+*Generated 2026-08-18 13:56 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### TWINLOOT-style Python Process Beaconing to SharePoint/Teams Infrastructure
+- **Actor / Campaign:** TWINLOOT (unattributed cluster)
+- **MITRE ATT&CK:** T1102.002 — Web Service: Bidirectional Communication; T1071.001 — Application Layer Protocol: Web Protocols
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// Look for python.exe/pyw.exe processes (not typical for user endpoints) initiating
+// outbound connections to SharePoint Online / Teams / Graph endpoints - possible C2 tasking channel
+DeviceProcessEvents
+| where FileName in~ ("python.exe", "python3.exe", "pythonw.exe")
+| join kind=inner (
+    DeviceNetworkEvents
+    | where RemoteUrl has_any ("sharepoint.com", "teams.microsoft.com", "graph.microsoft.com")
+       or RemoteIPType == "Public"
+) on DeviceId, $left.ProcessId == $right.InitiatingProcessId
+| where Timestamp1 between (Timestamp .. Timestamp + 5m)
+| project Timestamp, DeviceName, AccountName, FileName, FolderPath, ProcessCommandLine, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* Highly heuristic — legitimate automation/RPA tools also use Python + Graph/SharePoint APIs. Tune by excluding known dev/automation accounts and correlating with PyArmor-obfuscated binary names or unusual parent processes (e.g., non-IT-managed hosts).
+
+#### Legacy WMIC.exe Execution (Pre/Post Removal Abuse)
+- **Actor / Campaign:** unattributed (generic LOLBin abuse)
+- **MITRE ATT&CK:** T1047 — Windows Management Instrumentation
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+// WMIC is being removed from Windows 11 24H2/25H2 due to abuse; hunt for continued/anomalous
+// use, including copies dropped by attackers on systems where it's been removed by Microsoft
+DeviceProcessEvents
+| where FileName =~ "wmic.exe"
+| where ProcessCommandLine has_any ("process call create", "useraccount", "shadowcopy", "/node:", "service call")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName, FolderPath
+| take 100
+```
+
+*Note:* On updated builds where WMIC has been removed, any hit for wmic.exe is highly suspicious (dropped tool); on legacy builds, expect FPs from admin scripts — tune by excluding known management/ITSM accounts.
+
+#### Anomalous Azure/Entra Sign-Ins Following Credential Theft Reports
+- **Actor / Campaign:** unattributed (Azure credential theft actor)
+- **MITRE ATT&CK:** T1078.004 — Valid Accounts: Cloud Accounts
+- **Data source:** SigninLogs, AADNonInteractiveUserSignInLogs
+- **Source:** [3]
+
+```kql
+// Hunt for impossible-travel / new-location sign-ins with successful auth using
+// legacy or non-interactive flows, consistent with stolen credential resale reports
+SigninLogs
+| where ResultType == 0
+| summarize Countries = make_set(LocationDetails.countryOrRegion), IPs = make_set(IPAddress), Attempts = count()
+    by UserPrincipalName, bin(TimeGenerated, 1h)
+| where array_length(Countries) > 1 or array_length(IPs) > 3
+| project TimeGenerated, UserPrincipalName, Countries, IPs, Attempts
+| take 100
+```
+
+*Note:* Requires baseline of normal travel/VPN patterns per tenant; pair with Conditional Access / risky sign-in signals to reduce noise from corporate VPN egress IP rotation.
+
+#### Cavern C2 — DNS Tunneling / Google Apps Script Beaconing
+- **Actor / Campaign:** Cavern / Cav3rn (Iranian nation-state)
+- **MITRE ATT&CK:** T1071.004 — Application Layer Protocol: DNS; T1102 — Web Service
+- **Data source:** DeviceNetworkEvents, DnsEvents
+- **Source:** [4]
+
+```kql
+// Beaconing pattern: high-frequency DNS TXT-style lookups or repeated connections
+// to script.google.com from non-browser processes (Cavern uses DNS + Apps Script as C2)
+DeviceNetworkEvents
+| where RemoteUrl has "script.google.com"
+| where InitiatingProcessFileName !in~ ("chrome.exe","msedge.exe","firefox.exe","iexplore.exe")
+| summarize ConnCount = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by DeviceName, InitiatingProcessFileName, RemoteUrl
+| where ConnCount > 10
+| take 100
+```
+
+*Note:* Behavioral/heuristic only — no concrete Cavern IOCs given in this report; validate against process reputation and investigate any hits from servers/headless hosts rather than user browsers.
+
+#### Evooo1Bot — Mirai-Derivative SOCKS5 Proxy Behavior on Linux Edge Devices
+- **Actor / Campaign:** Evooo1Bot (Mirai-derived botnet)
+- **MITRE ATT&CK:** T1584.008 — Compromise Infrastructure: Network Devices; T1090 — Proxy
+- **Data source:** DeviceNetworkEvents (Linux), DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+// Linux edge devices exhibiting fan-out outbound connections consistent with acting as
+// a SOCKS5 proxy after Mirai-derived exploitation of known flaws
+DeviceNetworkEvents
+| where DeviceOSPlatform startswith "Linux"
+| summarize DistinctRemoteIPs = dcount(RemoteIP), DistinctPorts = dcount(RemotePort)
+    by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+| where DistinctRemoteIPs > 20 and DistinctPorts <= 3
+| take 100
+```
+
+*Note:* No specific IOCs published — this is proxy/fan-out behavior heuristic; requires Linux telemetry onboarding and tuning against known legitimate proxy/CDN appliances.
+
+#### Exposed Apple/VNC Screen Sharing Service (Port 5900)
+- **Actor / Campaign:** unattributed (opportunistic VNC scanning/abuse)
+- **MITRE ATT&CK:** T1021.005 — Remote Services: VNC
+- **Data source:** DeviceNetworkEvents, CommonSecurityLog (firewall)
+- **Source:** [5]
+
+```kql
+// Detect inbound/outbound connections on unencrypted VNC port 5900, historically used
+// by Apple Screen Sharing with weak/shared-password auth
+DeviceNetworkEvents
+| where RemotePort == 5900 or LocalPort == 5900
+| where RemoteIPType == "Public" or LocalIPType == "Public"
+| project Timestamp, DeviceName, LocalIP, LocalPort, RemoteIP, RemotePort, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Flags any internet-facing VNC exposure; expect FPs from legitimate remote-support tools using VNC — cross-check with asset inventory for macOS Screen Sharing enablement.
+
+#### Microsoft Defender Tampering Consistent with ShieldBreak (CVE-2026-69414) Exploitation Attempts
+- **Actor / Campaign:** unattributed ("ShieldBreak" zero-day, CVE-2026-69414)
+- **MITRE ATT&CK:** T1562.001 — Impair Defenses: Disable or Modify Tools
+- **Data source:** DeviceRegistryEvents, DeviceEvents
+- **Source:** [9]
+
+```kql
+// No public IOCs yet for ShieldBreak exploitation; hunt Defender config/state changes
+// that could indicate exploitation of the disclosed Defender zero-day
+DeviceEvents
+| where ActionType in ("AntivirusDetection","AntivirusScanCancelled","AntivirusConfigChanged","AmsiTampering")
+| where InitiatingProcessFileName !in~ ("MsMpEng.exe","MpCmdRun.exe")
+| project Timestamp, DeviceName, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Purely behavioral pending patch/IOC release — treat as low-confidence tripwire; monitor vendor advisory for CVE-2026-69414 IOCs/patch and update once available.
+
+#### Ray Dashboard/Job-Submission Abuse Consistent with CVE-2025-62593 (KEV)
+- **Actor / Campaign:** unattributed (Ray-Project code injection, actively exploited)
+- **MITRE ATT&CK:** T1210 — Exploitation of Remote Services
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [7], [10]
+
+```kql
+// Ray clusters exposing the dashboard/job-submission API (default port 8265) are exploitable
+// via code injection; hunt for anomalous child processes spawned from ray/python processes
+DeviceProcessEvents
+| where InitiatingProcessFileName in~ ("python.exe","python3", "ray")
+| where ProcessCommandLine has_any ("bash -c","curl ","wget ","/bin/sh","powershell")
+| where InitiatingProcessCommandLine has "ray"
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Confirm exposure by checking whether Ray dashboard port 8265 is internet-facing (per BOD 26-04 guidance); apply vendor patch/mitigation and prioritize any internet-exposed Ray clusters immediately.
+
+> [1] TWINLOOT Abuses SharePoint and Teams to Steal Credentials and Move Across Networks — https://thehackernews.com/2026/08/twinloot-abuses-sharepoint-and-teams-to.html
+> [2] Microsoft starts removing WMIC tool used by cybercriminals — https://www.bleepingcomputer.com/news/microsoft/microsoft-removes-wmic-lolbin-tool-in-windows-11-beta-builds/
+> [3] Hacker claims 3.6 million Azure account records stolen from major companies — https://www.bleepingcomputer.com/news/security/hacker-claims-36-million-azure-account-records-stolen-from-major-companies/
+> [4] Cavern C2 Uses DNS and Google Apps Script to Blend Into Legitimate Traffic — https://thehackernews.com/2026/08/cavern-c2-uses-dns-and-google-apps.html
+> [5] Apple Screen Sharing Security, (Mon, Aug 17th) — https://isc.sans.edu/diary/rss/33252
+> [7] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/17/cisa-adds-one-known-exploited-vulnerability-catalog
+> [8] Evooo1Bot Linux Botnet Exploits Known Flaws to Turn Edge Devices Into SOCKS5 Proxies — https://thehackernews.com/2026/08/evooo1bot-linux-botnet-exploits-known.html
+> [9] Microsoft working on Defender patch for ShieldBreak zero-day — https://www.bleepingcomputer.com/news/security/microsoft-working-on-defender-patch-for-shieldbreak-zero-day/
+> [10] CVE-2025-62593 — Ray-Project Ray: Ray-Project Ray Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2025-62593
