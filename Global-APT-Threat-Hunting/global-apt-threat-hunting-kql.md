@@ -3256,3 +3256,229 @@ DeviceProcessEvents
 > [8] Evooo1Bot Linux Botnet Exploits Known Flaws to Turn Edge Devices Into SOCKS5 Proxies — https://thehackernews.com/2026/08/evooo1bot-linux-botnet-exploits-known.html
 > [9] Microsoft working on Defender patch for ShieldBreak zero-day — https://www.bleepingcomputer.com/news/security/microsoft-working-on-defender-patch-for-shieldbreak-zero-day/
 > [10] CVE-2025-62593 — Ray-Project Ray: Ray-Project Ray Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2025-62593
+
+### 2026-08-19
+
+*Generated 2026-08-19 13:57 UTC · model `claude-sonnet-5`*
+
+_Lint: 10 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### TWINLOOT Python Implant Using SharePoint/Teams as C2
+- **Actor / Campaign:** TWINLOOT
+- **MITRE ATT&CK:** T1102.002 — Web Service: Bidirectional Communication (Trusted Third Party); T1059.006 — Python
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [4]
+
+```kql
+// Look for python interpreters (or PyInstaller-frozen exes) making regular calls to SharePoint Online / Graph endpoints
+// consistent with a hidden C2 tasking channel, especially from hosts that don't normally run python
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemoteUrl has_any ("sharepoint.com", "graph.microsoft.com") 
+| where InitiatingProcessFileName in~ ("python.exe", "pythonw.exe", "py.exe")
+| summarize ConnCount = count(), Urls = make_set(RemoteUrl, 10), FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by DeviceId, InitiatingProcessFileName, InitiatingProcessFolderPath
+| where ConnCount > 5
+| take 100
+```
+
+*Note:* Legitimate automation (e.g., Power Automate scripts, internal tooling) can also use Python + Graph/SharePoint APIs — validate the source folder path, PyArmor-related file artifacts, and whether the host is a workstation vs. an approved automation server before escalating. [4]
+
+#### PyArmor-Packed Python Implant File Artifacts
+- **Actor / Campaign:** TWINLOOT
+- **MITRE ATT&CK:** T1027.002 — Obfuscated Files or Information: Software Packing
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName endswith ".py" or FileName endswith ".pyz" or FileName endswith ".pyd"
+| where FolderPath has_any (@"\AppData\Local\Temp", @"\ProgramData", @"\Users\Public")
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where ProcessCommandLine has_any ("pyarmor", "__pyarmor__", "pytransform")
+) on DeviceId
+| project Timestamp, DeviceId, FileName, FolderPath, ProcessCommandLine
+| take 100
+```
+
+*Note:* PyArmor is also used legitimately by some vendors to protect commercial Python tools; correlate with the SharePoint/Teams C2 network pattern above to reduce noise. [4]
+
+#### MacSync Stealer — Newly Registered / Rotating Domain Beaconing from macOS
+- **Actor / Campaign:** MacSync Stealer
+- **MITRE ATT&CK:** T1071.001 — Application Layer Protocol: Web Protocols; T1583.001 — Acquire Infrastructure: Domains
+- **Data source:** DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+// No specific domains were published; this hunts the described *behavior* — macOS endpoints
+// contacting freshly-seen/rotating domains shortly after execution of an unsigned/unnotarized binary
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where DeviceId in (
+    DeviceInfo | where OSPlatform == "macOS" | distinct DeviceId
+)
+| where InitiatingProcessSignatureStatus != "Valid" or FileName has_any ("dmg", "pkg")
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(7d)
+) on DeviceId
+| where TimeGenerated1 between (Timestamp .. (Timestamp + 5m))
+| summarize DomainCount = dcount(RemoteUrl), Domains = make_set(RemoteUrl, 20) by DeviceId, InitiatingProcessFileName
+| where DomainCount > 3
+| take 100
+```
+
+*Note:* This is a heuristic proxy for Microsoft's "durable behavioral pivots" since no IOC domains were released in this summary; tune against your macOS fleet's baseline and consider pulling the 30+ domains from Microsoft's blog into a watchlist/TI indicator feed once published. [2]
+
+#### MacSync Stealer — macOS Keychain / Credential Store Access Followed by Outbound POST
+- **Actor / Campaign:** MacSync Stealer
+- **MITRE ATT&CK:** T1555.001 — Credentials from Password Stores: Keychain; T1041 — Exfiltration Over C2 Channel
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any ("security find-generic-password", "security dump-keychain", "login.keychain-db")
+| project Timestamp, DeviceId, AccountName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* `security` CLI keychain queries are used by legitimate apps and admins too; investigate parent process lineage and whether it's followed by unusual outbound network activity from the same device within minutes. [2]
+
+#### SilkParasite — Behavioral: New Persistence + C2-style Traffic on Government-Sector Hosts
+- **Actor / Campaign:** SilkParasite (unattributed, Central Asia-focused espionage)
+- **MITRE ATT&CK:** T1053.005 — Scheduled Task/Job; T1071 — Application Layer Protocol
+- **Data source:** DeviceProcessEvents, DeviceScheduledJobEvents, DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// No hashes/domains/filenames were published for the 5 new RATs; hunt generic multi-RAT tradecraft:
+// newly created scheduled task launching an unsigned binary that immediately opens outbound network connections.
+DeviceScheduledJobEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ScheduledTaskCreated"
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where InitiatingProcessSignatureStatus != "Valid"
+) on DeviceId
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+) on DeviceId
+| where abs(datetime_diff('minute', Timestamp1, Timestamp)) < 10
+| project Timestamp, DeviceId, InitiatingProcessFileName, InitiatingProcessFolderPath, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* This is intentionally broad/behavioral since the report gave no concrete IOCs for DriveSilkRAT, CookiETagRAT, NomadRAT, GoginRAT, or NodeEdgeRAT; treat as a triage query for government/defense tenants and pivot on hits with EDR process-tree review, not as a standalone high-confidence alert. [1]
+
+#### Post-Removal Hunting: Unexpected WMIC.exe Binary Presence (Native Removal Bypass)
+- **Actor / Campaign:** unattributed (LOLBIN abuse context)
+- **MITRE ATT&CK:** T1218 — System Binary Proxy Execution; T1036.003 — Masquerading: Rename System Utilities
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+// Microsoft is removing native WMIC from Windows 11 24H2/25H2; after removal, any wmic.exe execution
+// (especially from a non-System32 path, or on a build where it should no longer exist) is suspicious —
+// likely attacker-supplied binary abuse or a stale/backdoored copy.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "wmic.exe"
+| where FolderPath !~ @"C:\Windows\System32\wbem\WMIC.exe"
+| project Timestamp, DeviceId, AccountName, FolderPath, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Also alert on any wmic.exe execution at all on OS builds where Microsoft has removed it, since legitimate presence should be zero; check DeviceInfo.OSVersion to scope to 24H2/25H2 builds. [6]
+
+#### SharePoint Weak-Authentication Exploitation Pattern (CVE-2026-55040, KEV)
+- **Actor / Campaign:** unattributed (actively exploited per CISA KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1078 — Valid Accounts
+- **Data source:** OfficeActivity, DeviceProcessEvents (on-prem SharePoint servers), SigninLogs
+- **Source:** [5][9]
+
+```kql
+// On-prem/hybrid SharePoint: hunt for w3wp.exe spawning command interpreters or dropping files,
+// a classic post-auth-bypass webshell/RCE pattern seen with prior SharePoint auth/deserialization CVEs.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "w3wp.exe"
+| where FileName in~ ("cmd.exe", "powershell.exe", "powershell_ise.exe", "cscript.exe", "wscript.exe", "mshta.exe")
+| project Timestamp, DeviceId, AccountName, ProcessCommandLine, FolderPath
+| take 100
+```
+
+*Note:* Restrict to devices hosting SharePoint app pools; pair with SigninLogs/OfficeActivity anomalies (sign-ins bypassing MFA/expected auth flow) for CVE-2026-55040 specifically once patch/mitigation guidance is applied per BOD 26-04. [5][9]
+
+#### IKEEXT Service Crash / Anomalous Child Process (CVE-2026-33824, KEV)
+- **Actor / Campaign:** unattributed (actively exploited per CISA KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1499 — Endpoint Denial of Service (crash indicator) / T1210 — Exploitation of Remote Services
+- **Data source:** DeviceProcessEvents, Event (Security/System), DeviceNetworkEvents
+- **Source:** [5][7]
+
+```kql
+// IKE/IKEEXT runs inside svchost.exe; a double-free RCE exploit may manifest as unexpected
+// crashes/restarts of the IKEEXT-hosting svchost or a spawned child process it never normally creates.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "svchost.exe"
+| where InitiatingProcessCommandLine has "IKEEXT"
+| where FileName !in~ ("svchost.exe")
+| project Timestamp, DeviceId, InitiatingProcessCommandLine, FileName, FolderPath, ProcessCommandLine
+| take 100
+```
+
+*Note:* Endpoint telemetry alone may miss the memory-corruption exploit itself; supplement with Windows Event ID 7031/7034 (service crash) for the IKEEXT service and firewall/VPN-facing exposure review, since this is a remote-code-execution vuln in an IKE-exposed service. [5][7]
+
+#### macOS Screen Sharing (ARD/VNC) Authentication Bypass Hunt (CVE-2026-65400, KEV)
+- **Actor / Campaign:** unattributed (actively exploited per CISA KEV)
+- **MITRE ATT&CK:** T1021.005 — Remote Services: VNC; T1078 — Valid Accounts (bypass)
+- **Data source:** DeviceLogonEvents, DeviceNetworkEvents
+- **Source:** [5][10]
+
+```kql
+// Hunt for inbound Screen Sharing (ARD/VNC, TCP 5900/3283) connections to macOS devices followed
+// immediately by a local logon event with no corresponding successful credential prompt in logs.
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where DeviceId in (DeviceInfo | where OSPlatform == "macOS" | distinct DeviceId)
+| where LocalPort in (5900, 3283) and ActionType == "ConnectionAccepted"
+| project Timestamp, DeviceId, RemoteIP, RemotePort, LocalPort
+| take 100
+```
+
+*Note:* Defender for Endpoint macOS logon telemetry may be limited; cross-reference with macOS unified logs (`log show --predicate 'process == "ARDAgent"'`) and network flow data for a definitive check of anonymous Screen Sharing access until CVE-2026-65400 is patched. [5][10]
+
+#### VMware vCenter Path Traversal Access Attempts (CVE-2026-59310, KEV)
+- **Actor / Campaign:** unattributed (actively exploited per CISA KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1083 — File and Directory Discovery
+- **Data source:** CommonSecurityLog / Syslog (vCenter access logs ingested to Sentinel)
+- **Source:** [5][8]
+
+```kql
+// Requires vCenter/Apache Tomcat access logs forwarded via CEF/Syslog into Sentinel.
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceProduct has_any ("vCenter", "VMware")
+| where RequestURL has_any ("../", "..%2f", "..%5c", "%2e%2e")
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, RequestURL, DestinationIP
+| take 100
+```
+
+*Note:* Field/table names depend on your vCenter log forwarding configuration (CEF connector vs. custom syslog table); validate schema before deploying, and prioritize alerting on internet-exposed vCenter appliances per BOD 26-04. [5][8]
+
+> [1] SilkParasite Espionage Campaign Targets Central Asian Governments with Five New RATs — https://thehackernews.com/2026/08/silkparasite-espionage-campaign-targets.html
+> [2] Hunting MacSync Stealer infrastructure through behavioral pivots — https://www.microsoft.com/en-us/security/blog/2026/08/18/hunting-macsync-stealer-infrastructure-through-behavioral-pivots/
+> [4] TWINLOOT Abuses SharePoint and Teams to Steal Credentials and Move Across Networks — https://thehackernews.com/2026/08/twinloot-abuses-sharepoint-and-teams-to.html
+> [5] CISA Adds Four Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/18/cisa-adds-four-known-exploited-vulnerabilities-catalog
+> [6] Microsoft starts removing WMIC tool used by cybercriminals — https://www.bleepingcomputer.com/news/microsoft/microsoft-removes-wmic-lolbin-tool-in-windows-11-beta-builds/
+> [7] CVE-2026-33824 — Microsoft Internet Key Exchange (IKE) Service Extensions Double Free Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-33824
+> [8] CVE-2026-59310 — Broadcom VMware vCenter Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-59310
+> [9] CVE-2026-55040 — Microsoft SharePoint Weak Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-55040
+> [10] CVE-2026-65400 — Apple macOS Improper Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-65400
