@@ -3482,3 +3482,166 @@ CommonSecurityLog
 > [8] CVE-2026-59310 — Broadcom VMware vCenter Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-59310
 > [9] CVE-2026-55040 — Microsoft SharePoint Weak Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-55040
 > [10] CVE-2026-65400 — Apple macOS Improper Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-65400
+
+### 2026-08-20
+
+*Generated 2026-08-20 13:59 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### MLflow Server SSRF to Cloud Metadata Service (CVE-2026-64849)
+- **Actor / Campaign:** unattributed (KEV-listed, actively exploited)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application (SSRF leading to credential/metadata theft, T1552.005)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1][7][9]
+
+```kql
+// Detect MLflow (or related python/gunicorn/java) processes reaching cloud metadata endpoints
+// This is the classic SSRF-to-metadata-service pattern used to exploit CVE-2026-64849
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteIP in ("169.254.169.254", "100.100.100.200") // AWS/Azure/GCP + Alibaba metadata IPs
+| where InitiatingProcessCommandLine has_any ("mlflow", "gunicorn", "mlflow.server", "mlflow-server")
+    or InitiatingProcessFolderPath has "mlflow"
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteIP, RemotePort, RemoteUrl
+| take 100
+```
+
+*Note:* Requires MLflow tracking server hosts to be onboarded to MDE. Tune the process-name filter to your actual MLflow deployment (container entrypoint may differ); any hit against metadata IPs from an MLflow host warrants immediate investigation.
+
+#### Post-Exploitation Shell Spawned from MLflow Server Process
+- **Actor / Campaign:** unattributed (CVE-2026-64849 exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [1][7][9]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessCommandLine has "mlflow"
+| where FileName in~ ("bash","sh","curl","wget","python3","python","cmd.exe","powershell.exe","nc","ncat")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* MLflow tracking servers should not normally spawn shells or download utilities; flag any such child process for triage. Expect FP if MLflow is invoked via wrapper scripts — tune to your baseline.
+
+#### Suspicious Kernel Driver Service Creation (BYOVD Precursor — SPECTRE)
+- **Actor / Campaign:** UAT-10147 (SPECTRE implant)
+- **MITRE ATT&CK:** T1068 / T1543.003 — Bring Your Own Vulnerable Driver, Create or Modify System Process: Windows Service
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [3]
+
+```kql
+// BYOVD is commonly staged via sc.exe/registry service creation of type=kernel, followed by a .sys drop
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("sc.exe","reg.exe","powershell.exe")
+| where ProcessCommandLine has "create" and ProcessCommandLine has_any ("type= kernel","type=kernel","SERVICE_KERNEL_DRIVER")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine
+| union (
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FolderPath has @"\drivers\" and FileName endswith ".sys"
+    | where InitiatingProcessFileName !in~ ("wusa.exe","trustedinstaller.exe","msiexec.exe","dism.exe")
+    | project Timestamp, DeviceName, AccountName=InitiatingProcessAccountName, FileName, ProcessCommandLine=InitiatingProcessCommandLine
+)
+| take 100
+```
+
+*Note:* SPECTRE is reported to use BYOVD for kernel-level EDR bypass; this is a generic heuristic — cross-reference driver hashes against known-vulnerable-driver lists (e.g., LOLDrivers) and expect noise from legitimate driver installers, so tune by excluding trusted signing publishers.
+
+#### Suspicious Linux Kernel Module Load (Rootkit Behavior — SPECTRE)
+- **Actor / Campaign:** UAT-10147 (SPECTRE implant)
+- **MITRE ATT&CK:** T1547.006 — Boot or Logon Autostart Execution: Kernel Modules and Extensions; T1014 — Rootkit
+- **Data source:** DeviceProcessEvents (Linux)
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in ("insmod","modprobe","kmod","rmmod")
+| where ProcessCommandLine has ".ko"
+| where ProcessCommandLine !has_any ("/usr/lib/modules","/lib/modules") // outside standard module dirs
+| project Timestamp, DeviceName, InitiatingProcessAccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* SPECTRE includes a Linux rootkit component; loading modules from non-standard paths (e.g., /tmp, /dev/shm) is a strong signal but requires Linux MDE onboarding. Baseline your legitimate kernel module management tooling first to reduce FPs.
+
+#### Reconnaissance / Exploitation Tooling Targeting Siemens S7 PLCs (Port 102)
+- **Actor / Campaign:** unattributed (AI-generated S7 exploitation scripts per CISA/NSA/FBI advisory)
+- **MITRE ATT&CK:** T0846 — ICS: Remote System Discovery; T0866 — Exploitation of Remote Services
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [5][8]
+
+```kql
+// Process-level: presence of S7/ISO-TSAP scripting/scanning libraries or tools
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessCommandLine has_any ("snap7", "python-snap7", "s7comm", "S7comm", "pysnmp", "s7-1200", "s7-1500")
+   or (FileName in~ ("nmap.exe","masscan.exe","python.exe","python3.exe") and ProcessCommandLine has "102")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+```kql
+// Network-level: unexpected hosts talking to ISO-TSAP (TCP/102), the S7 protocol port
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemotePort == 102
+| summarize ConnCount = count(), RemoteIPs = make_set(RemoteIP), Processes = make_set(InitiatingProcessFileName)
+    by DeviceName, bin(Timestamp, 1h)
+| where ConnCount > 5   // tune to baseline engineering workstation traffic
+| take 100
+```
+
+*Note:* This is heuristic ICS reconnaissance detection; requires an allow-list of known engineering workstations/HMIs that legitimately talk TCP/102 to Siemens PLCs to avoid heavy FPs. Advisory notes scripts are disguised as legitimate management tools, so also review process signer/hash reputation for anything hitting port 102. [8]
+
+#### SilkParasite Custom RAT Artifact Strings
+- **Actor / Campaign:** SilkParasite (Central Asian government targeting)
+- **MITRE ATT&CK:** T1071 — Application Layer Protocol (C2); T1105 — Ingress Tool Transfer
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [6]
+
+```kql
+// Low-fidelity string hunt for analyst-assigned RAT family names possibly embedded in
+// dropped binaries, debug/PDB paths, mutex names, or C2 beacon strings
+union DeviceProcessEvents, DeviceFileEvents
+| where Timestamp > ago(30d)
+| where (isnotempty(ProcessCommandLine) and ProcessCommandLine has_any
+        ("DriveSilkRAT","CookiETagRAT","NomadRAT","GoginRAT","NodeEdgeRAT"))
+     or (isnotempty(FileName) and FileName has_any
+        ("DriveSilk","CookiETag","NomadRAT","GoginRAT","NodeEdge"))
+| project Timestamp, DeviceName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No hashes/domains/file names were published for the five new RAT families — these are researcher-assigned names and are unlikely to appear verbatim in the wild; this query is a placeholder for when Zimperium/HackerNews follow-up IOCs are released. Prioritize behavioral hunting (spearphishing delivery to government domains, unusual persistence via scheduled tasks/services) until concrete IOCs surface. [6]
+
+#### Android Accessibility Service Abuse (ToxicPanda 2.0 / GoldDigger On-Device Fraud)
+- **Actor / Campaign:** ToxicPanda 2.0 (aka TgToxic), GoldDigger
+- **MITRE ATT&CK:** T1417 — Input Capture (Mobile); T1626.001 — Abuse Elevated Execution Control (Accessibility Services)
+- **Data source:** DeviceEvents (Microsoft Defender for Endpoint on Android)
+- **Source:** [2]
+
+```kql
+// Behavioral hunt for accessibility-service abuse on managed Android devices, a hallmark
+// of ToxicPanda/GoldDigger overlay and on-device fraud workflows
+DeviceEvents
+| where Timestamp > ago(14d)
+| where ActionType has_any ("AccessibilityServiceEnabled","AccessibilityServiceRequested","AccessibilityPermissionGranted")
+| project Timestamp, DeviceName, DeviceId, ActionType, AdditionalFields
+| take 100
+```
+
+*Note:* ToxicPanda/GoldDigger are Android-only threats — this query depends on Defender for Endpoint mobile telemetry (DeviceEvents/ActionType schema for Android may vary by tenant/version, so validate field names against your environment). No concrete IOCs (package names, C2 domains) were published in the source, so this remains a coarse behavioral signal requiring correlation with banking-app installs and new/unusual accessibility grants.
+
+> [1] CISA warns of hackers exploiting critical MLflow vulnerability — https://www.bleepingcomputer.com/news/security/cisa-warns-of-hackers-exploiting-critical-mlflow-vulnerability/
+> [2] ToxicPanda 2.0 and GoldDigger Expand Android Banking Attacks with On-Device Fraud — https://thehackernews.com/2026/08/toxicpanda-20-and-golddigger-expand.html
+> [3] UAT-10147 deploys SPECTRE: A cross-platform implant with Linux rootkit and BYOVD capabilities — https://blog.talosintelligence.com/uat-10147-deploys-spectre-a-cross-platform-implant-with-linux-rootkit-and-byovd-capabilities/
+> [5] US warns of AI-powered attacks on Siemens PLCs in critical infrastructure — https://www.bleepingcomputer.com/news/security/us-warns-of-ai-powered-attacks-on-siemens-plcs-in-critical-infrastructure/
+> [6] SilkParasite Espionage Campaign Targets Central Asian Governments with Five New RATs — https://thehackernews.com/2026/08/silkparasite-espionage-campaign-targets.html
+> [7] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/19/cisa-adds-one-known-exploited-vulnerability-catalog
+> [8] Defending Against an Active Threat to Siemens S7 Series PLCs — https://www.cisa.gov/news-events/cybersecurity-advisories/aa26-231a
+> [9] CVE-2026-64849 — MLflow MLflow: MLflow Server-Side Request Forgery Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-64849
