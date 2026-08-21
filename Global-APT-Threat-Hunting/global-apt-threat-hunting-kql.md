@@ -3645,3 +3645,155 @@ DeviceEvents
 > [7] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/19/cisa-adds-one-known-exploited-vulnerability-catalog
 > [8] Defending Against an Active Threat to Siemens S7 Series PLCs — https://www.cisa.gov/news-events/cybersecurity-advisories/aa26-231a
 > [9] CVE-2026-64849 — MLflow MLflow: MLflow Server-Side Request Forgery Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-64849
+
+### 2026-08-21
+
+*Generated 2026-08-21 13:33 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Suspicious child process spawned from FTP client activity (E4del/PINHOLE banner abuse)
+- **Actor / Campaign:** Unattributed (E4del / PINHOLE RATs)
+- **MITRE ATT&CK:** T1071.002 — Application Layer Protocol: File Transfer Protocols / T1105 — Ingress Tool Transfer
+- **Data source:** DeviceNetworkEvents, DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+// Behavioral: no confirmed IOCs published; hunts for a host connecting to an FTP
+// server (port 21) followed shortly by an unexpected child process launch that
+// could reflect banner-embedded command execution.
+let ftpConns = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 21 and InitiatingProcessFileName in~ ("ftp.exe","cmd.exe","powershell.exe")
+| project DeviceId, ConnTime = Timestamp, RemoteIP, InitiatingProcessFileName;
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("cmd.exe","powershell.exe","mshta.exe","rundll32.exe","wscript.exe")
+| join kind=inner ftpConns on DeviceId
+| where Timestamp between (ConnTime .. ConnTime + 5m)
+| project Timestamp, DeviceId, FileName, ProcessCommandLine, RemoteIP, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Highly heuristic — tune to your environment's normal FTP usage (e.g., scheduled backup jobs) to reduce noise; no hashes/domains were published for E4del/PINHOLE so this is TTP-based only.
+
+#### Cargo/Rust build invoking network or execution tools during compilation (supply-chain build script abuse)
+- **Actor / Campaign:** Unattributed — Rust crates.io supply chain compromise (arrayref, internment, append-only-vec)
+- **MITRE ATT&CK:** T1195.001 — Supply Chain Compromise: Compromise Software Dependencies and Development Tools
+- **Data source:** DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("cargo.exe","rustc.exe","build-script-build.exe")
+   or InitiatingProcessCommandLine has_any ("build.rs","cargo build","cargo install")
+| where FileName in~ ("curl.exe","powershell.exe","cmd.exe","certutil.exe","wget.exe","cscript.exe","mshta.exe")
+| project Timestamp, DeviceId, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Flags build-time execution of network/download utilities from Rust build scripts — a strong indicator of malicious build.rs abuse; expect some FPs from legit build tooling that fetches assets, so review command lines and destination domains.
+
+#### Anomalous OAuth device-code / consent grants targeting high-risk sectors
+- **Actor / Campaign:** UNC6293, UNC7005, UNC5976 (suspected Russian espionage clusters)
+- **MITRE ATT&CK:** T1528 — Steal Application Access Token / T1566.002 — Phishing: Spearphishing Link (OAuth/device-code abuse)
+- **Data source:** SigninLogs, AADSignInEventsBeta, CloudAppEvents
+- **Source:** [4]
+
+```kql
+// Device-code / OAuth grant flow abuse commonly used to hijack Google/Microsoft accounts
+SigninLogs
+| where TimeGenerated > ago(14d)
+| where AuthenticationProtocol has "deviceCode" or ResultDescription has "device code"
+| extend AppUsed = tostring(AppDisplayName)
+| where AppUsed !in ("Microsoft Authenticator App") // tune allow-list
+| project TimeGenerated, UserPrincipalName, AppUsed, IPAddress, Location, ResultType, ResultDescription
+| take 100
+```
+
+```kql
+// Complementary: newly consented OAuth apps requesting broad mail/contacts scopes
+CloudAppEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("Consent to application.", "Add OAuth2PermissionGrant.")
+| extend Scopes = tostring(RawEventData.ConsentScope)
+| where Scopes has_any ("Mail.Read","Contacts.Read","offline_access")
+| project Timestamp, AccountDisplayName, Application, Scopes, IPAddress
+| take 100
+```
+
+*Note:* Device-code and consent-phishing flows are also used legitimately (CI/CD, IoT); baseline expected apps/users and pivot on new/rare AppDisplayName plus atypical geography or sign-in velocity.
+
+#### Suspicious process activity from MLflow server (CVE exploitation attempt)
+- **Actor / Campaign:** Unattributed — active exploitation per CISA warning
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [6]
+
+```kql
+// MLflow (typically python/gunicorn) spawning shell/script interpreters is abnormal
+// and consistent with RCE/deserialization exploitation of the platform.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("python.exe","python3","gunicorn","mlflow")
+| where FileName in~ ("bash","sh","cmd.exe","powershell.exe","wget","curl","nc","ncat")
+| project Timestamp, DeviceId, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* No specific IOCs published; verify against internet-exposed MLflow tracking servers first, then correlate with inbound requests on the MLflow API port for exploitation confirmation.
+
+#### Kernel driver load consistent with BYOVD (SPECTRE implant EDR bypass)
+- **Actor / Campaign:** UAT-10147 (SPECTRE implant)
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation / T1562.001 — Impair Defenses: Disable or Modify Tools (BYOVD)
+- **Data source:** DeviceDriverEvents (or DeviceEvents ActionType DriverLoaded), DeviceFileEvents
+- **Source:** [8]
+
+```kql
+DeviceDriverEvents
+| where Timestamp > ago(14d)
+| where ActionType == "DriverLoaded"
+| where FolderPath has_any (@"\Temp\", @"\Downloads\", @"\Users\Public\")
+   or FileName endswith ".sys" and isnotempty(InitiatingProcessCommandLine)
+| project Timestamp, DeviceId, FileName, FolderPath, SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+```kql
+// Companion: process injection / credential theft indicators from a newly-loaded, unsigned driver session
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessCommandLine has_any ("lsass", "sekurlsa", "MiniDump")
+| where InitiatingProcessFileName !in~ ("procdump.exe","taskmgr.exe") // known-legit dump tools
+| project Timestamp, DeviceId, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Tune the folder-path allow-list to your driver-signing/EDR agent update paths to avoid FPs; no file hashes were published for SPECTRE so signature-based matching isn't yet possible — pair with Talos IOC feed once released.
+
+#### Inbound traffic to TrueConf Server management port (CVE-2026-72529 / CVE-2026-72530 exploitation)
+- **Actor / Campaign:** Unattributed — actively exploited per CISA KEV
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceNetworkEvents
+- **Source:** [5][9][10]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where LocalPort == 4307 or RemotePort == 4307
+| summarize Attempts = count(), Sources = make_set(RemoteIP, 20) by DeviceId, LocalPort, RemotePort, bin(Timestamp, 1h)
+| where Attempts > 5
+| take 100
+```
+
+*Note:* Port 4307/TCP is the vulnerable TrueConf Server management interface; investigate any external/untrusted source IPs hitting this port, especially on internet-facing hosts, and correlate with subsequent process creation on the TrueConf host for successful exploitation.
+
+> [2] Hackers abuse FTP server banners to deliver new Windows malware — https://www.bleepingcomputer.com/news/security/hackers-abuse-ftp-server-banners-to-deliver-new-windows-malware/
+> [3] Rust Supply Chain Attack Puts Build-Time Malware in Crates with 245 Million Downloads — https://thehackernews.com/2026/08/rust-supply-chain-attack-puts-build.html
+> [4] Suspected Russian Hackers Abuse Google OAuth and WhatsApp Linking to Hijack Accounts — https://thehackernews.com/2026/08/suspected-russian-hackers-abuse-google.html
+> [5] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/20/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [6] CISA warns of hackers exploiting critical MLflow vulnerability — https://www.bleepingcomputer.com/news/security/cisa-warns-of-hackers-exploiting-critical-mlflow-vulnerability/
+> [8] UAT-10147 deploys SPECTRE: A cross-platform implant with Linux rootkit and BYOVD capabilities — https://blog.talosintelligence.com/uat-10147-deploys-spectre-a-cross-platform-implant-with-linux-rootkit-and-byovd-capabilities/
+> [9] CVE-2026-72530 — TrueConf Server: TrueConf Server Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-72530
+> [10] CVE-2026-72529 — TrueConf Server: TrueConf Server Missing Authentication for Critical Function Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-72529
