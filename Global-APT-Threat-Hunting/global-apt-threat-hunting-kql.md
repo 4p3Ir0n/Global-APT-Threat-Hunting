@@ -3797,3 +3797,126 @@ DeviceNetworkEvents
 > [8] UAT-10147 deploys SPECTRE: A cross-platform implant with Linux rootkit and BYOVD capabilities — https://blog.talosintelligence.com/uat-10147-deploys-spectre-a-cross-platform-implant-with-linux-rootkit-and-byovd-capabilities/
 > [9] CVE-2026-72530 — TrueConf Server: TrueConf Server Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-72530
 > [10] CVE-2026-72529 — TrueConf Server: TrueConf Server Missing Authentication for Critical Function Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-72529
+
+### 2026-08-22
+
+*Generated 2026-08-22 13:26 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Trojanized npm package launching a detached Linux binary post-install
+- **Actor / Campaign:** unattributed (RedC2 4.0 npm supply-chain campaign)
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Compromise Software Supply Chain; T1204.003 — User Execution: Malicious Image
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [2]
+
+```kql
+// Linux (or macOS) endpoints: npm/node spawning chmod +x on a bundled binary then launching it detached
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("node", "npm", "npm.exe", "node.exe")
+| where FileName in~ ("chmod", "chmod.exe")
+| where ProcessCommandLine has "+x"
+| project Timestamp, DeviceName, DeviceId, InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine, ProcessCommandLine, FolderPath
+| take 100
+```
+
+*Note:* No concrete package names or hashes were published in the reporting; this hunts the behavioral pattern (node_modules dropping + chmod +x + background exec). Validate FolderPath is under a `node_modules` tree to reduce noise from legitimate build scripts.
+
+#### Node process spawning a background/detached executable (post-install persistence)
+- **Actor / Campaign:** unattributed (RedC2 4.0 npm supply-chain campaign)
+- **MITRE ATT&CK:** T1543 — Create or Modify System Process; T1071.001 — Application Layer Protocol: Web Protocols (AI-assisted C2)
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("node", "npm", "node.exe", "npm.exe")
+| where FolderPath has "node_modules"
+| where ProcessCommandLine has_any ("nohup", "setsid", "&", "disown")
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(7d)
+    | where InitiatingProcessFolderPath has "node_modules"
+) on DeviceId
+| project Timestamp, DeviceName, ProcessCommandLine, RemoteUrl, RemoteIP, RemotePort
+| take 100
+```
+
+*Note:* Heuristic — flags any node_modules-spawned process that also makes outbound network calls; tune folder path scoping (e.g., limit to CI/build servers or developer workstations) to cut FPs from legitimate native-module build helpers.
+
+#### FTP client spawning a shell/script shortly after connecting (banner-based malware delivery)
+- **Actor / Campaign:** unattributed (E4del / PINHOLE RAT campaign)
+- **MITRE ATT&CK:** T1071.002 — Application Layer Protocol: File Transfer Protocols; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceNetworkEvents, DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+let ftpSessions = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 21 or InitiatingProcessFileName in~ ("ftp.exe")
+| project DeviceId, DeviceName, ConnTime = Timestamp, RemoteIP, RemoteUrl;
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("ftp.exe")
+| where FileName in~ ("cmd.exe", "powershell.exe", "mshta.exe", "wscript.exe", "cscript.exe", "rundll32.exe")
+| join kind=inner ftpSessions on DeviceId
+| where Timestamp between (ConnTime .. ConnTime + 10m)
+| project Timestamp, DeviceName, ProcessCommandLine, FileName, RemoteIP, RemoteUrl, ConnTime
+| take 100
+```
+
+*Note:* No file hashes/names for E4del or PINHOLE were disclosed; this looks for the described technique (FTP banner text parsed and executed as commands). Expect FPs from legitimate scripted FTP automation — validate against known FTP script inventories.
+
+#### Suspicious shell spawned from Zimbra mailboxd (potential CVE-2026-73570 exploitation)
+- **Actor / Campaign:** unattributed (KEV-listed Zimbra ZCS OS command injection)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1059.004 — Command and Scripting Interpreter: Unix Shell
+- **Data source:** DeviceProcessEvents (Linux onboarded via Defender for Endpoint), DeviceNetworkEvents
+- **Source:** [4] [7]
+
+```kql
+// Requires Zimbra host onboarded to Defender for Endpoint (Linux)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName has_any ("java", "mailboxd", "zmmailboxdmgr", "postfix", "smtpd")
+| where FileName in~ ("sh", "bash", "curl", "wget", "python3", "perl", "nc")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+```kql
+// Complementary: unusual outbound connections from Zimbra process shortly after SMTP activity on 25/465/587
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName has_any ("java", "mailboxd")
+| where RemotePort !in (25, 465, 587, 993, 143)
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* No exploitation IOCs were published for CVE-2026-73570; this is TTP-based hunting for post-exploitation command execution from the mail server process. Patch per CISA KEV/BOD 26-04 guidance regardless of alert hits; tune process/parent lists to your actual ZCS deployment.
+
+#### CI/CD build agent contacting cloud metadata endpoint or exfiltrating credentials
+- **Actor / Campaign:** unattributed (SDLC / CI-CD supply chain targeting)
+- **MITRE ATT&CK:** T1552.005 — Unsecured Credentials: Cloud Instance Metadata API; T1195.001 — Compromise Software Dependencies and Development Tools
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName has_any ("Runner.Listener", "jenkins", "gitlab-runner", "azure-pipelines-agent", "buildkite-agent")
+| where ProcessCommandLine has_any ("169.254.169.254", "metadata.google.internal", "aws sts get-caller-identity", "gcloud auth print-access-token", ".npmrc", "id_rsa")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* This is fully behavioral (no IOCs published for a specific campaign); it targets the article's theme of attackers pivoting to CI/CD/dev-tool infrastructure rather than app code. Baseline legitimate pipeline steps that call cloud metadata/credential helpers before enabling as an alert.
+
+> [1] Connecting the Dots: Securing the Overlooked Corners of the Software Development Lifecycle (SDLC) Supply Chain — https://unit42.paloaltonetworks.com/sdlc-supply-chain/
+> [2] 14 Trojanized npm Packages Drop RedC2 4.0 Linux Backdoor With AI-Assisted C2 — https://thehackernews.com/2026/08/14-trojanized-npm-packages-drop-redc2.html
+> [4] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/21/cisa-adds-one-known-exploited-vulnerability-catalog
+> [6] Hackers abuse FTP server banners to deliver new Windows malware — https://www.bleepingcomputer.com/news/security/hackers-abuse-ftp-server-banners-to-deliver-new-windows-malware/
+> [7] CVE-2026-73570 — Synacor Zimbra Collaboration Suite (ZCS): OS Command Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-73570
