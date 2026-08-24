@@ -3930,3 +3930,123 @@ _Lint: no KQL blocks detected._
 _No detectable material in today's reporting._
 
 > [1] TikTok Agrees to $400 Million Settlement in U.S. Child Privacy Lawsuit — https://thehackernews.com/2026/08/tiktok-agrees-to-400-million-settlement.html
+
+### 2026-08-24
+
+*Generated 2026-08-24 13:58 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### ClickFix / FakeCaptcha Clipboard Execution Pattern (WordlistLoader → Amatera)
+- **Actor / Campaign:** ClearFake / WordlistLoader (unattributed)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where ParentProcessFileName in~ ("explorer.exe", "cmd.exe")
+| where FileName in~ ("powershell.exe", "cmd.exe", "mshta.exe", "wscript.exe", "cscript.exe")
+// ClickFix chains typically run a pasted PowerShell/mshta one-liner after a fake "verify you are human" prompt
+| where ProcessCommandLine has_any ("IEX", "DownloadString", "-enc", "-EncodedCommand", "FromBase64String", "iwr ")
+| where ProcessCommandLine has_any ("captcha", "verify", "cloudflare", "recaptcha", "human")
+| project Timestamp, DeviceName, AccountName, ParentProcessFileName, FileName, ProcessCommandLine, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* Heuristic and keyword-based; tune the lure keyword list to your telemetry, and expect FPs from legitimate helpdesk/self-service scripts that also reference "verify" or use IEX. No concrete Amatera/WordlistLoader hashes were published in the source, so this targets the ClickFix delivery TTP.
+
+#### Suspicious mshta.exe Remote HTA Execution (ClearFake stager pattern)
+- **Actor / Campaign:** ClearFake / WordlistLoader (unattributed)
+- **MITRE ATT&CK:** T1218.005 — System Binary Proxy Execution: Mshta
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "mshta.exe"
+| where ProcessCommandLine has_any ("http://", "https://")
+| project Timestamp, DeviceName, AccountName, ParentProcessFileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* mshta loading remote content is a longstanding ClearFake/ClickFix stager technique; legitimate mshta usage with remote URLs is rare in most environments but validate against internal tooling before alerting.
+
+#### SynkLoader-Style Credential Prompt / Password Harvesting Behavior
+- **Actor / Campaign:** SynkLoader (unattributed)
+- **MITRE ATT&CK:** T1056.002 — Input Capture: GUI Input Capture
+- **Data source:** DeviceProcessEvents, DeviceEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(3d)
+| where ParentProcessFileName in~ ("explorer.exe", "powershell.exe", "mshta.exe")
+| where FileName has_any ("credential", "login", "auth", "vault")
+   or ProcessCommandLine has_any ("CredentialUIPromptForCredentials", "vaultcmd", "cmdkey")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, ParentProcessFileName
+| take 100
+```
+
+*Note:* No file names/hashes for SynkLoader were disclosed in the reporting; this is a broad behavioral proxy for fake Windows-credential-prompt phishing and will need heavy tuning — treat as a starting hypothesis, not a production rule.
+
+#### Outbound QUIC (UDP/443) from Non-Browser Process — Possible QUICAgent Backdoor C2
+- **Actor / Campaign:** Operation QUICSILVER / QUICAgent (China-nexus, moderate confidence)
+- **MITRE ATT&CK:** T1071.001 — Application Layer Protocol: Web Protocols (QUIC abuse for C2)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where Protocol == "Udp" and RemotePort == 443
+| where InitiatingProcessFileName !in~ ("chrome.exe","msedge.exe","firefox.exe","brave.exe","opera.exe","teams.exe")
+| where InitiatingProcessFileName endswith ".exe"
+| summarize ConnCount = count(), RemoteIPs = make_set(RemoteIP, 10) by DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath
+| where ConnCount > 5
+| take 100
+```
+
+*Note:* QUICAgent is described as a Go backdoor; Go binaries often statically implement QUIC/HTTP3 outside the browser stack, making non-browser UDP/443 traffic a useful anomaly signal — but this needs baselining per environment (legitimate apps like game clients or CDNs also use QUIC).
+
+#### Phishing Lure Execution Chain from LNK/Document (Graduation Invitation Theme)
+- **Actor / Campaign:** Operation QUICSILVER / QUICAgent (China-nexus, moderate confidence)
+- **MITRE ATT&CK:** T1204.002 — User Execution: Malicious File
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where FileName in~ ("powershell.exe", "cmd.exe", "wscript.exe", "mshta.exe", "rundll32.exe")
+| where InitiatingProcessCommandLine has ".lnk"
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* No specific lure file names or hashes were published; this hunts the generic LNK-double-click-to-script-execution chain often used in spear-phishing droppers targeting government/IT sectors in Myanmar. Cross-reference with recent inbound email/attachment activity for higher confidence.
+
+#### Android App Requesting VPN Permission While Blocking Play Store Access (ToxicPanda-style defense evasion)
+- **Actor / Campaign:** ToxicPanda
+- **MITRE ATT&CK (Mobile):** T1629.003 — Impair Defenses: Disable or Modify Tools
+- **Data source:** DeviceEvents (Microsoft Defender for Endpoint on Android), AlertEvidence
+- **Source:** [3]
+
+```kql
+// Best-effort hunt using MDE-for-Android telemetry; column/action names vary by tenant configuration and should be validated.
+DeviceEvents
+| where Timestamp > ago(14d)
+| where ActionType has_any ("AndroidPermissionGranted", "AndroidVpnServiceStarted", "AndroidAppInstalled")
+| where AdditionalFields has_any ("VPN", "android.permission.BIND_VPN_SERVICE")
+| project Timestamp, DeviceName, ActionType, AdditionalFields
+| take 100
+```
+
+*Note:* ToxicPanda is Android-only malware; native Defender XDR/Sentinel coverage for mobile is limited to MDE-for-Android/Intune signals, so exact table/column names (`ActionType`, `AdditionalFields`) must be validated against your tenant's mobile threat defense schema. No IOCs (APK names/hashes) were given in the source — this is purely behavior-based (VPN-permission abuse to block Google Play traffic) and will require environment-specific tuning or a switch to MTD/Intune-native alert queries.
+
+> [1] WordlistLoader Delivers Amatera via ClickFix, SynkLoader Phishes Windows Passwords — https://thehackernews.com/2026/08/wordlistloader-delivers-amatera-via.html
+> [2] Operation QUICSILVER Targets Myanmar Government and IT with QUICAgent Backdoor — https://thehackernews.com/2026/08/operation-quicsilver-targets-myanmar.html
+> [3] ToxicPanda Android malware uses VPN permissions to block Google Play — https://www.bleepingcomputer.com/news/security/toxicpanda-android-malware-uses-vpn-permissions-to-block-google-play/
