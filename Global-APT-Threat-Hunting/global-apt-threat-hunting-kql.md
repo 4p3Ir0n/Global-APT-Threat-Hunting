@@ -4050,3 +4050,187 @@ DeviceEvents
 > [1] WordlistLoader Delivers Amatera via ClickFix, SynkLoader Phishes Windows Passwords — https://thehackernews.com/2026/08/wordlistloader-delivers-amatera-via.html
 > [2] Operation QUICSILVER Targets Myanmar Government and IT with QUICAgent Backdoor — https://thehackernews.com/2026/08/operation-quicsilver-targets-myanmar.html
 > [3] ToxicPanda Android malware uses VPN permissions to block Google Play — https://www.bleepingcomputer.com/news/security/toxicpanda-android-malware-uses-vpn-permissions-to-block-google-play/
+
+### 2026-08-25
+
+*Generated 2026-08-25 13:34 UTC · model `claude-sonnet-5`*
+
+_Lint: 9 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Zimbra Collaboration Suite RCE — Post-Exploitation Shell Spawn
+- **Actor / Campaign:** Unattributed mass-exploitation campaign (270+ Zimbra servers)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1505.003 — Web Shell
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [1]
+
+```kql
+// Zimbra (ZCS) runs mailboxd under a Java process; shells spawned from it are a strong post-RCE indicator
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("java.exe","java")
+| where FileName in~ ("sh","bash","cmd.exe","powershell.exe","curl","wget","python3","perl")
+| where InitiatingProcessCommandLine has_any ("zimbra", "mailboxd", "zmmailbox")
+    or InitiatingProcessFolderPath has_any ("/opt/zimbra", "zimbra")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Tune the Zimbra path/command-line filters to your environment's install path; legitimate admin scripts under zimbra service accounts can trigger this, so validate against known maintenance jobs.
+
+#### Suspicious File Drop in Zimbra Webapp Directories (Webshell)
+- **Actor / Campaign:** Unattributed mass-exploitation campaign (270+ Zimbra servers)
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceFileEvents
+- **Source:** [1]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FolderPath has_any ("/zimbra/", "mailboxd/webapps")
+| where FileName endswith_cs ".jsp" or FileName endswith_cs ".jspx" or FileName endswith_cs ".war"
+| where InitiatingProcessFileName in~ ("java.exe","java")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Baseline against normal ZCS update/patch operations that legitimately write JSP/WAR files; flag only unexpected file names or off-hours drops.
+
+#### npm/unpkg Mirror Redirect to Fake CAPTCHA (ClickFix-style)
+- **Actor / Campaign:** Unattributed npm/ClickFix phishing infra abuse
+- **MITRE ATT&CK:** T1204.001 — User Execution: Malicious Link; T1583.006 — Acquire Infrastructure: Web Services
+- **Data source:** DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(2d)
+| where RemoteUrl has "unpkg.com"
+| where RemoteUrl has_any ("captcha", "cloudflare", "verify", "checking")
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteUrl, RemoteIP, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* No specific package names/hashes were published; tune the URL keyword list as IOCs emerge, and expect noise from legitimate unpkg CDN traffic — pair with browser-process context (edge/chrome navigating from email/redirect).
+
+#### ClickFix Pattern: Clipboard-Paste Execution via mshta/PowerShell
+- **Actor / Campaign:** WordlistLoader → Amatera Stealer / ClearFake; also relevant to [2]
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste; T1027 — Obfuscated Files or Information
+- **Data source:** DeviceProcessEvents
+- **Source:** [6], [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where FileName in~ ("mshta.exe","powershell.exe","pwsh.exe","cmd.exe")
+| where ProcessCommandLine has_any ("IEX", "Invoke-Expression", "DownloadString", "FromBase64String", "-w hidden", "-windowstyle hidden")
+| where InitiatingProcessFileName in~ ("explorer.exe","RuntimeBroker.exe")  // typical ClickFix parent when launched via Win+R
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* This is the generic ClickFix/FakeCaptcha "paste-and-run" behavioral signature; expect false positives from legitimate admin scripting — correlate with recent browser navigation to unfamiliar domains for higher fidelity.
+
+#### SynkLoader-style Fake Credential Prompt / Password Harvesting
+- **Actor / Campaign:** SynkLoader (Gen Digital reporting)
+- **MITRE ATT&CK:** T1056.002 — Input Capture: GUI Input Capture; T1555 — Credentials from Password Stores
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [6]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where ProcessCommandLine has_any ("credui", "LogonUI", "password", "sign in to continue") 
+| where FileName !in~ ("LogonUI.exe", "consent.exe")  // exclude legit OS binaries
+| where InitiatingProcessFileName has_any ("mshta.exe","powershell.exe","wscript.exe","cscript.exe")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Behavioral/heuristic only — no IOCs published for SynkLoader; this looks for non-OS binaries mimicking Windows credential dialogs. Requires tuning to your environment to reduce noise from legitimate MFA/credential tools.
+
+#### Outbound FTP Banner Grab Followed by New C2 Connection (Dead Drop Resolver Pattern)
+- **Actor / Campaign:** E4del / PINHOLE RATs
+- **MITRE ATT&CK:** T1102 — Web Service (Dead Drop Resolver); T1071.001 — Application Layer Protocol
+- **Data source:** DeviceNetworkEvents
+- **Source:** [3]
+
+```kql
+// Flag non-standard processes connecting to FTP (port 21) shortly before establishing a new outbound connection — potential DDR-to-C2 pivot
+let ftpConnections = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 21
+| where InitiatingProcessFileName !in~ ("ftp.exe","filezilla.exe","winscp.exe","curl.exe")
+| project DeviceName, ftpTime = Timestamp, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteIP;
+ftpConnections
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(7d)
+    | where RemotePort !in (21,80,443)
+    | project DeviceName, c2Time = Timestamp, RemoteIP2 = RemoteIP, RemotePort, InitiatingProcessFileName
+) on DeviceName
+| where c2Time between (ftpTime .. ftpTime + 10m)
+| project DeviceName, ftpTime, InitiatingProcessFileName, c2Time, RemoteIP2, RemotePort
+| take 100
+```
+
+*Note:* Highly heuristic — designed to surface unusual FTP-then-pivot behavior since no concrete IOCs were published for E4del/PINHOLE; expect false positives in environments with legitimate scripted FTP workflows, tune time window and excluded processes accordingly.
+
+#### Suspected QUICAgent Backdoor — QUIC/UDP-443 from Non-Browser Process
+- **Actor / Campaign:** Operation QUICSILVER (China-nexus, targeting Myanmar govt/IT)
+- **MITRE ATT&CK:** T1071.001 — Application Layer Protocol: Web Protocols; T1071.004 — DNS/QUIC-based C2; T1566.001 — Spearphishing Attachment
+- **Data source:** DeviceNetworkEvents, DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 443 and Protocol == "Udp"
+| where InitiatingProcessFileName !in~ ("chrome.exe","msedge.exe","firefox.exe","brave.exe","opera.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, RemoteIP, RemoteUrl, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* QUIC (UDP/443) from non-browser binaries is unusual and worth investigating for Go-compiled backdoors like QUICAgent; correlate with recent execution of "graduation ceremony invitation" themed lure files (DeviceFileEvents on .lnk/.zip/.iso attachments) for higher confidence.
+
+#### Spearphishing Lure Execution Chain (Graduation Invitation Theme)
+- **Actor / Campaign:** Operation QUICSILVER
+- **MITRE ATT&CK:** T1566.001 — Spearphishing Attachment; T1204.002 — User Execution: Malicious File
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName has_any ("invitation","graduation","ceremony") 
+| where FileName endswith ".lnk" or FileName endswith ".iso" or FileName endswith ".zip" or FileName endswith ".exe"
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, SHA256
+| take 100
+```
+
+*Note:* No file hashes were published; this is a filename-theme heuristic that should be combined with the QUIC network detection above and refined once concrete IOCs are released.
+
+#### Oracle HTTP Server / WebLogic Proxy Plug-in Post-Exploitation Command Execution
+- **Actor / Campaign:** CVE-2026-21962 exploitation (KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [7], [9]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("httpd.exe","httpd.worker","java.exe","java")
+| where InitiatingProcessCommandLine has_any ("weblogic", "OHS", "mod_wl_ohs")
+| where FileName in~ ("cmd.exe","powershell.exe","sh","bash","wget","curl","nc","nc.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* CVE-2026-21962 is an improper access control flaw in the WebLogic Proxy Plug-in; this query is behavioral (shell spawned from the web/proxy tier) since no public exploit request pattern was detailed — prioritize patching per CISA BOD 26-04 and validate hits against known admin automation.
+
+> [1] Hackers breached over 270 Zimbra servers in ongoing attacks — https://www.bleepingcomputer.com/news/security/hackers-breached-over-270-zimbra-servers-in-ongoing-attacks/
+> [2] 24 npm Packages Abuse unpkg Mirrors to Host Fake Cloudflare CAPTCHA Pages — https://thehackernews.com/2026/08/24-npm-packages-abuse-unpkg-mirrors-to.html
+> [3] E4del and PINHOLE RATs Turn FTP Banners Into Dead Drops for Malware Commands — https://thehackernews.com/2026/08/e4del-and-pinhole-rats-turn-ftp-banners.html
+> [6] WordlistLoader Delivers Amatera via ClickFix, SynkLoader Phishes Windows Passwords — https://thehackernews.com/2026/08/wordlistloader-delivers-amatera-via.html
+> [7] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/24/cisa-adds-one-known-exploited-vulnerability-catalog
+> [8] Operation QUICSILVER Targets Myanmar Government and IT with QUICAgent Backdoor — https://thehackernews.com/2026/08/operation-quicsilver-targets-myanmar.html
+> [9] CVE-2026-21962 — Oracle HTTP Server and Oracle Weblogic Server Proxy Plug-in Improper Access Control Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-21962
