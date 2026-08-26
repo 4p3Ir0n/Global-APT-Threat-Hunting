@@ -4234,3 +4234,148 @@ DeviceProcessEvents
 > [7] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/24/cisa-adds-one-known-exploited-vulnerability-catalog
 > [8] Operation QUICSILVER Targets Myanmar Government and IT with QUICAgent Backdoor — https://thehackernews.com/2026/08/operation-quicsilver-targets-myanmar.html
 > [9] CVE-2026-21962 — Oracle HTTP Server and Oracle Weblogic Server Proxy Plug-in Improper Access Control Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-21962
+
+### 2026-08-26
+
+*Generated 2026-08-26 13:37 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Unsigned side-loaded DLL awaiting a "magic packet" (possible SLEEPWALKER backdoor)
+- **Actor / Campaign:** unattributed (independent researcher disclosure)
+- **MITRE ATT&CK:** T1574.002 — Hijack Execution Flow: DLL Side-Loading; T1205 — Traffic Signaling
+- **Data source:** DeviceImageLoadEvents, DeviceFileCertificateInfo
+- **Source:** [2]
+
+```kql
+// SLEEPWALKER is reported as an unsigned 64-bit DLL, 59,904 bytes, built for side-loading.
+// No hashes were published, so hunt on the reported file-size heuristic + unsigned status.
+DeviceImageLoadEvents
+| where FileSize == 59904
+| where FileName endswith ".dll"
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessFileName, InitiatingProcessFileName, SHA256
+| join kind=leftouter (
+    DeviceFileCertificateInfo
+    | project SHA256, IsSigned, Signer
+) on SHA256
+| where IsSigned == false or isempty(Signer)
+| take 100
+```
+
+*Note:* Purely heuristic (file size + unsigned status) since no hash/filename IOCs were released; expect FPs from legitimate small unsigned DLLs — pivot to processes that then open a listening socket with no outbound traffic for long periods to further narrow.
+
+#### Suspicious child process spawned by Zimbra collaboration suite (mass exploitation)
+- **Actor / Campaign:** unattributed, opportunistic mass exploitation (270+ ZCS servers)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("zmmailboxd", "mailboxd", "java")
+| where InitiatingProcessCommandLine has_any ("zimbra", "zmmailboxd")
+| where FileName in~ ("sh", "bash", "curl", "wget", "python3", "perl", "nc")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No specific IOCs published; tune to your Zimbra parent-process names/paths. High-fidelity only if Zimbra hosts are onboarded to Defender for Endpoint (Linux sensor).
+
+#### Emails/links pointing to npm/unpkg-hosted fake CAPTCHA pages
+- **Actor / Campaign:** unattributed (npm/unpkg phishing redirect abuse — 24 packages)
+- **MITRE ATT&CK:** T1608.001 — Stage Capabilities: Upload Malware; T1204.001 — User Execution: Malicious Link
+- **Data source:** EmailEvents, EmailUrlInfo
+- **Source:** [4], [16]
+
+```kql
+EmailEvents
+| where Timestamp > ago(7d)
+| join kind=inner (EmailUrlInfo) on NetworkMessageId
+| where Url has_any ("unpkg.com", "npmjs.org", "jsdelivr.net")
+| where Url has_any ("captcha", "verify", "cloudflare", "checking-your-browser")
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject, Url, NetworkMessageId
+| take 100
+```
+
+*Note:* unpkg.com/jsdelivr are legitimate CDNs, so combine with the suspicious path keywords shown; validate against known-good developer traffic before alerting broadly.
+
+#### Endpoint navigation to npm-mirror-hosted ClickFix-style CAPTCHA redirect
+- **Actor / Campaign:** unattributed (24-package npm/unpkg cluster)
+- **MITRE ATT&CK:** T1204.001 — User Execution: Malicious Link; T1027 — Obfuscated Files or Information
+- **Data source:** DeviceNetworkEvents
+- **Source:** [4], [16]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemoteUrl has "unpkg.com"
+| where RemoteUrl has_any ("captcha", "verify-you-are-human", "cf-challenge")
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* RemoteUrl field availability depends on proxy/TLS inspection integration; adjust to your network telemetry table (e.g., a proxy log table) if RemoteUrl isn't populated for HTTPS.
+
+#### Outbound FTP banner grabs from non-FTP client processes (E4del/PINHOLE dead-drop resolver)
+- **Actor / Campaign:** unattributed (E4del / PINHOLE RATs)
+- **MITRE ATT&CK:** T1102 — Web Service (Dead Drop Resolver); T1071 — Application Layer Protocol
+- **Data source:** DeviceNetworkEvents
+- **Source:** [17]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemotePort == 21
+| where InitiatingProcessFileName !in~ ("ftp.exe", "filezilla.exe", "winscp.exe", "curl.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessFolderPath, RemoteIP, RemoteUrl
+| take 100
+```
+
+*Note:* Behavioral only — no IOCs were disclosed for E4del/PINHOLE. Flag repeated brief connections to varying FTP hosts (banner scraping) from unexpected processes like scripting interpreters or LOLBins; expect FPs from legitimate automation/backup tools using FTP.
+
+#### Shell execution spawned by Gitea service (CVE-2026-60004 exploitation)
+- **Actor / Campaign:** unattributed; CVE-2026-60004 added to CISA KEV
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1546 — Event Triggered Execution (Git Hook)
+- **Data source:** DeviceProcessEvents
+- **Source:** [11], [19]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has "gitea"
+| where FileName in~ ("sh", "bash", "cmd.exe", "powershell.exe", "python", "perl")
+| where InitiatingProcessCommandLine has_any ("diffpatch", "hooks", "post-receive", "pre-receive")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Requires Gitea host to be onboarded to Defender for Endpoint (or equivalent Linux auditd ingestion); the vulnerability plants a malicious git hook via the diffpatch API and executes as the Gitea service account, so also alert on unexpected writes under `.git/hooks/`.
+
+#### Kerberoasting-style SPN ticket requests (domain compromise TTP from CISA red team findings)
+- **Actor / Campaign:** unattributed; CISA red team assessment findings
+- **MITRE ATT&CK:** T1558.003 — Steal or Forge Kerberos Tickets: Kerberoasting
+- **Data source:** SecurityEvent (Windows Security 4769)
+- **Source:** [10]
+
+```kql
+SecurityEvent
+| where EventID == 4769
+| where TicketEncryptionType == "0x17" // RC4 - common kerberoasting indicator
+| where TargetUserName !endswith "$" // exclude machine accounts
+| summarize RequestCount = count(), DistinctSPNs = dcount(TargetUserName) by Account = SubjectUserName, IpAddress, bin(TimeGenerated, 1h)
+| where RequestCount > 15
+| order by RequestCount desc
+| take 100
+```
+
+*Note:* Both red-team-assessed organizations reached full domain compromise; this is a generic, well-known Kerberoasting hunt to help detect the type of privilege-escalation activity described, not tied to a specific tool — tune the count threshold to your baseline SPN request volume.
+
+> [2] New SLEEPWALKER Backdoor Waits for One Crafted Packet, Then Runs Its Own Bytecode — https://thehackernews.com/2026/08/newly-sleepwalker-backdoor-waits-for.html
+> [4] Hackers abuse npm mirrors to host phishing redirect pages — https://www.bleepingcomputer.com/news/security/hackers-abuse-npm-mirrors-to-host-phishing-redirect-pages/
+> [8] Hackers breached over 270 Zimbra servers in ongoing attacks — https://www.bleepingcomputer.com/news/security/hackers-breached-over-270-zimbra-servers-in-ongoing-attacks/
+> [10] A Tale of Two SOCs: Insights From Two Red Team Assessments — https://www.cisa.gov/news-events/cybersecurity-advisories/aa26-237a
+> [11] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/25/cisa-adds-one-known-exploited-vulnerability-catalog
+> [16] 24 npm Packages Abuse unpkg Mirrors to Host Fake Cloudflare CAPTCHA Pages — https://thehackernews.com/2026/08/24-npm-packages-abuse-unpkg-mirrors-to.html
+> [17] E4del and PINHOLE RATs Turn FTP Banners Into Dead Drops for Malware Commands — https://thehackernews.com/2026/08/e4del-and-pinhole-rats-turn-ftp-banners.html
+> [19] CVE-2026-60004 — Gitea Gitea: Gitea Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-60004
