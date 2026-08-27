@@ -4379,3 +4379,194 @@ SecurityEvent
 > [16] 24 npm Packages Abuse unpkg Mirrors to Host Fake Cloudflare CAPTCHA Pages — https://thehackernews.com/2026/08/24-npm-packages-abuse-unpkg-mirrors-to.html
 > [17] E4del and PINHOLE RATs Turn FTP Banners Into Dead Drops for Malware Commands — https://thehackernews.com/2026/08/e4del-and-pinhole-rats-turn-ftp-banners.html
 > [19] CVE-2026-60004 — Gitea Gitea: Gitea Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-60004
+
+### 2026-08-27
+
+*Generated 2026-08-27 16:57 UTC · model `claude-sonnet-5`*
+
+_Lint: 10 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### PaperCut NG/MF Zero-Day Exploitation — Suspicious Child Process from Print Server
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1210 — Exploitation of Remote Services
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("pc-app.exe","PCClient.exe","pc-server.exe","tomcat9.exe","javaw.exe")
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","cscript.exe","wscript.exe","mshta.exe","certutil.exe")
+| where InitiatingProcessFolderPath has_any ("PaperCut","papercut")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* No PaperCut IOCs were published; this is a behavioral hunt for the historically-observed PaperCut RCE pattern (web app spawning a shell). Validate PaperCut install paths in your environment and tune to your PaperCut service/process names.
+
+#### PaperCut NG/MF — Outbound Connections from Print Server to Uncommon Hosts Post-Exploit
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1105 — Ingress Tool Transfer
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("pc-app.exe","PCClient.exe","pc-server.exe","javaw.exe")
+| where RemoteIPType == "Public"
+| where isnotempty(RemoteUrl) or isnotempty(RemoteIP)
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* Zero-day details/IOCs are not yet public; this flags any outbound activity initiated by PaperCut processes for manual triage — baseline normal PaperCut external calls (license checks, updates) before enabling as an alert.
+
+#### GoCaracal-Style C2 Resolution via Ethereum Smart Contract Call
+- **Actor / Campaign:** Dark Caracal (GoCaracal, medium confidence)
+- **MITRE ATT&CK:** T1568.002 — Dynamic Resolution: Domain Generation Algorithms (analogous: blockchain-based C2 lookup)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [7]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any ("infura.io","alchemy.com","etherscan.io","eth-mainnet","rpc.ankr.com","cloudflare-eth.com")
+| where InitiatingProcessFileName !in~ ("chrome.exe","msedge.exe","firefox.exe","brave.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, RemoteUrl, RemoteIP, AccountName
+| take 100
+```
+
+*Note:* Behavioral hunt only — no GoCaracal hashes/domains were disclosed. Flags non-browser processes querying Ethereum RPC/explorer endpoints, a technique used by GoCaracal to fetch a replacement C2 address; expect FPs from crypto-wallet or dev tooling and tune the process allowlist.
+
+#### GoCaracal-Style Go Binary with Remote Shell / Keylogger Behavior
+- **Actor / Campaign:** Dark Caracal (GoCaracal)
+- **MITRE ATT&CK:** T1059 — Command and Scripting Interpreter, T1056 — Input Capture
+- **Data source:** DeviceProcessEvents, DeviceImageLoadEvents
+- **Source:** [7]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName has_any (".exe") and InitiatingProcessCommandLine has_any ("golang","GOMAXPROCS","runtime.")
+| where ProcessCommandLine has_any ("-shell","-keylog","-rdp","-c2","-payload")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, AccountName
+| take 100
+```
+
+*Note:* Heuristic and likely low-yield without a known binary signature; use as a starting hunt query for unsigned Go binaries with shell/keylog/RDP command-line flags rather than a production alert.
+
+#### Nimbus Manticore — SSH Tunneling Tool Launched by Unusual Parent Process
+- **Actor / Campaign:** Nimbus Manticore (Iranian IRGC-affiliated)
+- **MITRE ATT&CK:** T1572 — Protocol Tunneling
+- **Data source:** DeviceProcessEvents
+- **Source:** [9]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("plink.exe","ssh.exe","putty.exe")
+| where ProcessCommandLine has_any ("-R ","-L ","-D ","-N ","-ssh")
+| where InitiatingProcessFileName !in~ ("explorer.exe","cmd.exe","powershell.exe")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessFolderPath, AccountName
+| take 100
+```
+
+*Note:* Group-IB's report on Nimbus Manticore's SSH tunneler/backdoor did not include specific filenames or hashes in the summary provided; this looks for anomalous SSH/tunnel tooling launched from non-interactive parents. Tune out legitimate admin/DevOps SSH usage.
+
+#### Nimbus Manticore — New Backdoor Persistence via Scheduled Task / Run Key
+- **Actor / Campaign:** Nimbus Manticore
+- **MITRE ATT&CK:** T1053.005 — Scheduled Task, T1547.001 — Registry Run Keys
+- **Data source:** DeviceProcessEvents, DeviceRegistryEvents
+- **Source:** [9]
+
+```kql
+DeviceRegistryEvents
+| where Timestamp > ago(14d)
+| where RegistryKey has @"\Software\Microsoft\Windows\CurrentVersion\Run"
+| where InitiatingProcessFileName !in~ ("explorer.exe","msiexec.exe","setup.exe")
+| project Timestamp, DeviceName, RegistryKey, RegistryValueName, RegistryValueData, InitiatingProcessFileName, AccountName
+| take 100
+```
+
+*Note:* Generic persistence hunt aligned with Nimbus Manticore's TWOSTROKE-like backdoor behavior; no concrete registry paths were published, so expect broad results requiring baselining against known-good software.
+
+#### NovaCookies AitM — Docusign-Themed Phishing Redirect Emails
+- **Actor / Campaign:** NovaCookies phishing-as-a-service
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link, T1557 — AitM
+- **Data source:** EmailEvents, EmailUrlInfo
+- **Source:** [10]
+
+```kql
+EmailEvents
+| where Timestamp > ago(14d)
+| join kind=inner (EmailUrlInfo) on NetworkMessageId
+| where SenderFromAddress has "docusign" or Subject has_any ("DocuSign","Please DocuSign","Completed:")
+| where Url !has "docusign.net" and Url !has "docusign.com"
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject, Url
+| take 100
+```
+
+*Note:* Looks for genuine-looking Docusign notification emails whose embedded links do not resolve to legitimate Docusign domains, matching the NovaCookies AitM redirect technique; validate against your tenant's actual Docusign integration to avoid FPs from legitimate signing links using custom domains.
+
+#### NovaCookies AitM — M365 Sign-in Immediately Following External Redirect Link Click
+- **Actor / Campaign:** NovaCookies phishing-as-a-service
+- **MITRE ATT&CK:** T1557 — Adversary-in-the-Middle, T1550.004 — Use of Web Session Cookie
+- **Data source:** SigninLogs
+- **Source:** [10]
+
+```kql
+SigninLogs
+| where TimeGenerated > ago(14d)
+| where ResultType == 0
+| where AuthenticationRequirement == "singleFactorAuthentication" or ConditionalAccessStatus == "notApplied"
+| where AppDisplayName has_any ("Office 365","Microsoft 365")
+| summarize LogonCount = count(), IPs = make_set(IPAddress), Countries = make_set(Location) by UserPrincipalName, bin(TimeGenerated, 1h)
+| where array_length(IPs) > 1
+| take 100
+```
+
+*Note:* Heuristic for session-cookie replay after AitM capture (multiple IPs/locations for the same user in a short window); requires tuning against corporate VPN egress and known travel patterns to reduce FPs.
+
+#### SQL Server RCE (CVE-2019-1068) — sqlservr.exe Spawning Command Interpreter
+- **Actor / Campaign:** unattributed (KEV-listed actively exploited CVE)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [11][18]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "sqlservr.exe"
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","certutil.exe","mshta.exe","bcp.exe","xp_cmdshell.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Classic post-exploitation pattern for SQL Server RCE/xp_cmdshell abuse now added to KEV; legitimate DBA scripts using xp_cmdshell will trigger this, so cross-reference with change tickets before escalating.
+
+#### Ajax.NET Professional Deserialization RCE (CVE-2021-23758) — IIS Worker Process Spawning Shell
+- **Actor / Campaign:** unattributed (KEV-listed actively exploited CVE)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application, T1059.003 — Windows Command Shell
+- **Data source:** DeviceProcessEvents
+- **Source:** [11][13]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "w3wp.exe"
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","csc.exe","cscript.exe")
+| where InitiatingProcessCommandLine has_any ("ajaxpro","AjaxPro.axd")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* AjaxPro is EoL and rarely still deployed; this hunts for the deserialization-to-shell pattern via the /ajaxpro/*.axd handler. If AjaxPro isn't in your environment, deprioritize this query.
+
+> [1] PaperCut warns of NG, MF flaw exploited in zero-day attacks — https://www.bleepingcomputer.com/news/security/papercut-warns-of-ng-mf-flaw-exploited-in-zero-day-attacks/
+> [7] GoCaracal Malware Uses Ethereum Smart Contract to Fetch Replacement C2 Address — https://thehackernews.com/2026/08/gocaracal-malware-uses-ethereum-smart.html
+> [9] Nimbus Manticore Expands Toolset With TWOSTROKE-Like Backdoor and SSH Tunneler — https://thehackernews.com/2026/08/nimbus-manticore-expands-toolset-with.html
+> [10] NovaCookies Campaigns Abuse Genuine Docusign Notifications to Steal Microsoft 365 Sessions — https://thehackernews.com/2026/08/novacookies-campaigns-abuse-genuine.html
+> [11] CISA Adds Six Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/26/cisa-adds-six-known-exploited-vulnerabilities-catalog
+> [13] CVE-2021-23758 — Ajax.NET Professional Deserialization of Untrusted Data Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2021-23758
+> [18] CVE-2019-1068 — Microsoft SQL Server Remote Code Execution Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2019-1068
