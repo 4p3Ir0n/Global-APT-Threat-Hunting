@@ -4570,3 +4570,172 @@ DeviceProcessEvents
 > [11] CISA Adds Six Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/26/cisa-adds-six-known-exploited-vulnerabilities-catalog
 > [13] CVE-2021-23758 — Ajax.NET Professional Deserialization of Untrusted Data Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2021-23758
 > [18] CVE-2019-1068 — Microsoft SQL Server Remote Code Execution Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2019-1068
+
+### 2026-08-28
+
+*Generated 2026-08-28 17:22 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — query 4: unbalanced '()'. All queries are CANDIDATES; validate before use._
+
+#### PaperCut Server Spawning Shell/Script Post-Exploitation (Zero-Day)
+- **Actor / Campaign:** Unattributed (PaperCut NG/MF zero-day, actively exploited)
+- **MITRE ATT&CK:** T1210 — Exploitation of Remote Services; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [3][6]
+
+```kql
+// No public IOCs released yet for the PaperCut zero-day; hunt for the classic
+// post-exploitation pattern of the PaperCut server process (Java/Jetty backend)
+// spawning a command interpreter, mirroring prior PaperCut RCE abuse patterns.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("java.exe", "javaw.exe", "pc-app.exe", "PCAppServer.exe")
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "cscript.exe", "wscript.exe", "mshta.exe", "rundll32.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* PaperCut server processes rarely spawn interpreters under normal operation; validate host actually runs PaperCut NG/MF and check patch status/version before treating as high-confidence. Tune process names to your specific PaperCut install path.
+
+#### Suspicious Batch Script Persistence Consistent with APT28 HOOKEDGE Backdoor
+- **Actor / Campaign:** APT28 (Fancy Bear) — HOOKEDGE backdoor
+- **MITRE ATT&CK:** T1059.003 — Windows Command Shell; T1053.005 — Scheduled Task; T1071 — Application Layer Protocol (C2)
+- **Data source:** DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+// HOOKEDGE is reported as a lightweight Windows batch-script backdoor targeting
+// European gov/diplomatic entities. Hunt for .bat scripts creating persistence
+// (scheduled tasks / run keys) or making outbound network calls via LOLBins.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("cmd.exe")
+| where ProcessCommandLine has ".bat"
+| where ProcessCommandLine has_any ("schtasks", "reg add", "curl", "certutil", "bitsadmin", "powershell")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName, FolderPath
+| take 100
+```
+
+*Note:* Highly heuristic — batch scripts and schtasks are common in legitimate admin activity; scope to gov/diplomatic tenants, review script content/paths (temp/download dirs, email attachment origin) and correlate with recent Office/email delivery.
+
+#### cPanel/WHM Root Process Spawn Following Domain Parking Exploit
+- **Actor / Campaign:** Unattributed (CVE-2026-65643 cPanel/WHM critical RCE)
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+// CVE-2026-65643 allows a hosting customer to gain root via domain
+// parking/addon domain handling. Hunt for cpsrvd/whostmgr spawning
+// unexpected shells or privilege-escalating child processes as root.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("cpsrvd", "whostmgrd", "cpanel", "cpanellogd")
+| where FileName in~ ("bash", "sh", "python3", "perl", "su", "sudo")
+| where InitiatingProcessAccountName == "root" or AccountName == "root"
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Requires Defender for Servers / Linux sensor coverage on cPanel hosts; expect noise from legitimate cPanel maintenance scripts — baseline normal cpsrvd child processes before alerting.
+
+#### Command-Injection Style Requests to Chinese-Manufactured Embedded/Router Management Interfaces
+- **Actor / Campaign:** Unattributed (ZBT router implants SPEAKINGSTONE/DARKLANTERN; Xiiaozet LK100W; Ebyte NA111-M)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1078 — Valid Accounts (auth bypass)
+- **Data source:** CommonSecurityLog, DeviceNetworkEvents
+- **Source:** [1][8][10]
+
+```kql
+// Behavioral hunt for OS command-injection attempts against embedded/router
+// web management interfaces (ZBT/Xiiaozet/Ebyte families report unauthenticated
+// root command execution / auth-bypass CVEs). No public network IOCs supplied.
+CommonSecurityLog
+| where TimeGenerated > ago(7d)
+| where RequestURL has_any ("cgi-bin", "goform", "setup.cgi", "adm.cgi")
+| where RequestURL has_any (";", "|", "$(", "`", "&&", "wget ", "curl ")
+| project TimeGenerated, DeviceVendor, SourceIP, DestinationIP, RequestURL, DeviceAction
+| take 100
+```
+
+*Note:* These are embedded devices typically outside EDR coverage — this relies on perimeter firewall/WAF logs ingested via CommonSecurityLog; adjust field/parser names to your actual log source and expect false positives from legitimate query strings containing special characters.
+
+#### JFrog Artifactory Writes Outside Expected Docker Cache Path (CVE-2026-66384)
+- **Actor / Campaign:** Unattributed (CISA KEV — actively exploited)
+- **MITRE ATT&CK:** T1211 — Exploitation for Defense Evasion; T1083 — File and Directory Discovery (path traversal)
+- **Data source:** DeviceFileEvents
+- **Source:** [9][15]
+
+```kql
+// CVE-2026-66384: authenticated user can write outside the intended Docker
+// cache path via a remote-repository path traversal condition.
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("artifactory", "java")
+| where FolderPath has "artifactory"
+| where FolderPath !has @"cache\docker" and FolderPath !has "docker-cache"
+| where FolderPath has_any ("../", "..\\")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* Requires host-based sensor coverage on Artifactory servers; tune folder-path patterns to your Artifactory storage layout, and confirm patch level (this is a KEV-listed, actively exploited flaw).
+
+#### ownCloud Unauthenticated File Access via Known-Username Auth Bypass (CVE-2023-49105)
+- **Actor / Campaign:** Unattributed (CISA KEV — actively exploited)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1078 — Valid Accounts
+- **Data source:** CommonSecurityLog / AADNonInteractiveUserSignInLogs (adjust to your ownCloud auth log ingestion)
+- **Source:** [9][13]
+
+```kql
+// CVE-2023-49105: attacker can access/modify/delete files without
+// authentication if a victim username is known and no signing-key is set.
+// Hunt for WebDAV requests succeeding without a prior successful auth event.
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where RequestURL has "remote.php/dav"
+| where DeviceAction in ("PROPFIND", "GET", "PUT", "DELETE")
+| where isempty(RequestClientApplication) or RequestURL !has "Authorization"
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, DeviceAction
+| take 100
+```
+
+*Note:* Log field names will vary heavily by reverse-proxy/WAF vendor exporting to CommonSecurityLog; this is a template — validate against your actual ownCloud/WebDAV access log schema, and prioritize hosts still unpatched per BOD 26-04.
+
+#### Suspicious Network Activity from Compromised OSS Security Tooling (Trivy / Checkmarx KICS / LiteLLM)
+- **Actor / Campaign:** TeamPCP (March 2026 supply-chain compromise; suspects charged 2026-08-27)
+- **MITRE ATT&CK:** T1195.001 — Compromise Software Dependencies and Development Tools; T1071 — Application Layer Protocol
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [7][12]
+
+```kql
+// TeamPCP compromised Trivy, Checkmarx KICS, and LiteLLM in March 2026.
+// Hunt CI/build hosts for these tools making unexpected outbound connections
+// (no specific C2 IOCs published; behavioral only).
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any ("trivy", "kics", "litellm")
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where RemoteIPType == "Public"
+) on DeviceId
+| where abs(datetime_diff('second', Timestamp, Timestamp1)) < 60
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* No malicious hashes/domains were provided in the reporting; this simply flags CI/build systems running the named tools that also initiate unexpected external connections — validate against known package registries/CDNs to reduce noise, and confirm tool versions against the disclosed compromised releases.
+
+> [1] China-Made ZBT Routers Ship With Two Implants Giving Unauthenticated Attackers Root Access — https://thehackernews.com/2026/08/china-made-zbt-routers-ship-with-two.html
+> [2] Critical cPanel Flaw Could Let One Hosting Customer Take Root Control of a Whole Server — https://thehackernews.com/2026/08/critical-cpanel-flaw-could-let-one.html
+> [3] PaperCut Zero-Day Exploited in Attacks, Affecting All NG and MF Versions — https://thehackernews.com/2026/08/papercut-zero-day-exploited-in-attacks.html
+> [4] APT28-Linked HOOKEDGE Backdoor Targets European Government and Diplomatic Organizations — https://thehackernews.com/2026/08/apt28-linked-hookedge-backdoor-targets.html
+> [6] PaperCut warns of NG, MF flaw exploited in zero-day attacks — https://www.bleepingcomputer.com/news/security/papercut-warns-of-ng-mf-flaw-exploited-in-zero-day-attacks/
+> [7] Australia arrests alleged TeamPCP hackers behind supply-chain attacks — https://www.bleepingcomputer.com/news/security/australia-arrests-alleged-teampcp-hackers-behind-supply-chain-attacks/
+> [8] Xiiaozet LK100W — https://www.cisa.gov/news-events/ics-advisories/icsa-26-239-01
+> [9] CISA Adds Three Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/27/cisa-adds-three-known-exploited-vulnerabilities-catalog
+> [10] Ebyte NA111-M — https://www.cisa.gov/news-events/ics-advisories/icsa-26-239-05
+> [12] Alleged TeamPCP Hackers Charged in Australia Over Major Supply Chain Attacks — https://thehackernews.com/2026/08/alleged-teampcp-hackers-charged-in.html
+> [13] CVE-2023-49105 — ownCloud ownCloud: ownCloud Improper Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2023-49105
+> [15] CVE-2026-66384 — JFrog Artifactory: JFrog Artifactory Improper Limitation of a Pathname to a Restricted Directory Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-66384
