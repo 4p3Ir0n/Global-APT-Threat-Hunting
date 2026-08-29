@@ -4739,3 +4739,163 @@ DeviceProcessEvents
 > [12] Alleged TeamPCP Hackers Charged in Australia Over Major Supply Chain Attacks — https://thehackernews.com/2026/08/alleged-teampcp-hackers-charged-in.html
 > [13] CVE-2023-49105 — ownCloud ownCloud: ownCloud Improper Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2023-49105
 > [15] CVE-2026-66384 — JFrog Artifactory: JFrog Artifactory Improper Limitation of a Pathname to a Restricted Directory Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-66384
+
+### 2026-08-29
+
+*Generated 2026-08-29 13:21 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — query 5: unbalanced '()'. All queries are CANDIDATES; validate before use._
+
+#### ClickFix-style clipboard execution via Run dialog (TerminalFix)
+- **Actor / Campaign:** TerminalFix (unattributed cluster tracked by Microsoft)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// ClickFix pattern: explorer.exe directly spawns a script host / LOLBin
+// (user pasted a "verification" command from a fake CAPTCHA page into Win+R)
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where FileName in~ ("mshta.exe","powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe","curl.exe","conhost.exe")
+| where ProcessCommandLine has_any ("captcha","verify","robot","cloudflare","recaptcha","i am human") 
+    or ProcessCommandLine has_any ("iex","downloadstring","-enc","frombase64string")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Tune the keyword list to your environment's phishing lures; ClickFix lures rotate often, so also alert on any explorer.exe → mshta.exe/powershell.exe parent-child relationship regardless of command-line content, then review manually.
+
+#### DLL sideloading from user-writable path following suspicious execution
+- **Actor / Campaign:** TerminalFix
+- **MITRE ATT&CK:** T1574.002 — Hijack Execution Flow: DLL Side-Loading
+- **Data source:** DeviceImageLoadEvents, DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// Legitimate signed binary loading a DLL from a user-writable / temp / download folder
+DeviceImageLoadEvents
+| where Timestamp > ago(2d)
+| where FolderPath has_any (@"\AppData\Local\Temp\", @"\Downloads\", @"\AppData\Roaming\")
+| where InitiatingProcessFolderPath !has @"\Windows\System32"
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(2d)
+    | where InitiatingProcessFileName =~ "explorer.exe" or ProcessCommandLine has_any ("verify","captcha")
+) on $left.InitiatingProcessSHA256 == $right.SHA256
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, FolderPath
+| take 100
+```
+
+*Note:* High false-positive potential from legitimate portable apps; correlate with the ClickFix execution chain above or with newly-created/rarely-seen signed binaries in the same folder for higher confidence.
+
+#### Outbound reverse-tunnel connection from LOLBin process
+- **Actor / Campaign:** TerminalFix
+- **MITRE ATT&CK:** T1572 — Protocol Tunneling
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// LOLBins/interpreters establishing outbound connections shortly after a ClickFix-style launch
+DeviceNetworkEvents
+| where Timestamp > ago(2d)
+| where InitiatingProcessFileName in~ ("powershell.exe","pwsh.exe","mshta.exe","cmd.exe","rundll32.exe","regsvr32.exe")
+| where RemotePort !in (80,443)
+| where isnotempty(RemoteIP)
+| summarize ConnCount=count(), Ports=make_set(RemotePort) by DeviceName, InitiatingProcessFileName, RemoteIP, bin(Timestamp,1h)
+| where ConnCount > 3
+| take 100
+```
+
+*Note:* Non-standard ports from scripting hosts are heuristic; expect noise from legitimate admin tooling and RMM software — no concrete tunnel infrastructure IOCs were published in [1], so validate against known-good remote management tools in your estate.
+
+#### Web-server process spawning shell after possible ownCloud CVE-2023-49105 exploitation
+- **Actor / Campaign:** Chinese-speaking threat actor targeting Philippine nuclear research body
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents (Linux/Windows sensor on the web/app server)
+- **Source:** [3]
+
+```kql
+// PHP/Apache/nginx worker process unexpectedly spawning a shell or interpreter
+// (common post-exploitation pattern for ownCloud pre-auth signature bypass -> RCE/webshell)
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where InitiatingProcessFileName has_any ("php","php-fpm","httpd","apache2","nginx")
+| where FileName in~ ("sh","bash","curl","wget","python3","perl","id","whoami","cmd.exe","powershell.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Standard "webshell child process" heuristic — expect FPs from legitimate cron/health-check scripts; scope to hosts running ownCloud and prioritize alerts where the target CVE-2023-49105 KEV entry applies and the server was not yet patched.
+
+#### Unauthenticated command-injection attempts against ZBT router admin interface
+- **Actor / Campaign:** unattributed (ZBT SPEAKINGSTONE / DARKLANTERN factory implants)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1200 — Hardware Additions (supply-chain implant)
+- **Data source:** CommonSecurityLog / AzureFirewall / DeviceNetworkEvents (perimeter/firewall telemetry)
+- **Source:** [4]
+
+```kql
+// Behavioral hunt for unauthenticated CGI command-injection attempts against embedded router admin panels
+// No published IOCs for CVE-2026-74232/74233 exploitation traffic in [4]; heuristic on URI/command patterns
+CommonSecurityLog
+| where TimeGenerated > ago(2d)
+| where RequestURL has_any ("cgi-bin", "goform", "adm.cgi", "boafrm")
+| where RequestURL has_any (";", "|", "$(", "`", "&&")
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, DeviceVendor, DeviceProduct
+| take 100
+```
+
+*Note:* This is a generic embedded-device command-injection heuristic, not specific to SPEAKINGSTONE/DARKLANTERN traffic — inventory ZBT/OEM-rebranded routers on your network and prioritize matches against them; expect noise from vulnerability scanners.
+
+#### PaperCut server spawning shell/script host (zero-day exploitation pattern)
+- **Actor / Campaign:** unattributed, active PaperCut NG/MF zero-day exploitation
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+// PaperCut print management service unexpectedly launching command interpreters
+// (matches prior PaperCut RCE exploitation chains, e.g. CVE-2023-27350 pattern)
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where InitiatingProcessFileName in~ ("pc-app.exe","pc-client.exe","java.exe","PCServer.exe","pcprogtray.exe")
+| where InitiatingProcessCommandLine has_any ("papercut","PaperCut")
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","cscript.exe","wscript.exe","mshta.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No exploit IOCs were published yet at time of writing [6]; this reuses the known PaperCut RCE child-process pattern. Patch to the emergency release and treat any hit as high-priority given the "confirmed customer incidents" statement.
+
+#### Suspicious batch script backdoor persistence (HOOKEDGE-style)
+- **Actor / Campaign:** APT28 (HOOKEDGE backdoor, Recorded Future Insikt Group)
+- **MITRE ATT&CK:** T1059.003 — Command and Scripting Interpreter: Windows Command Shell; T1053.005 — Scheduled Task
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [7]
+
+```kql
+// Lightweight batch-script backdoors are often persisted via scheduled tasks or startup keys,
+// executed repeatedly by cmd.exe with no parent GUI application
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where FileName =~ "cmd.exe"
+| where ProcessCommandLine has ".bat"
+| where InitiatingProcessFileName in~ ("schtasks.exe","svchost.exe","taskeng.exe","explorer.exe")
+| join kind=leftouter (
+    DeviceFileEvents
+    | where Timestamp > ago(2d)
+    | where FileName endswith ".bat"
+    | where FolderPath has_any (@"\AppData\", @"\ProgramData\", @"\Public\")
+) on DeviceName
+| project Timestamp, DeviceName, InitiatingProcessFileName, ProcessCommandLine, FolderPath, FileName1
+| take 100
+```
+
+*Note:* HOOKEDGE distribution/delivery mechanism was not fully detailed in [7]; this is a broad heuristic for recurring batch-script execution consistent with a lightweight persistence backdoor and requires tuning to your baseline of legitimate scheduled batch jobs (esp. on government/diplomatic endpoints in scope of the reported regions).
+
+> [1] TerminalFix campaign deploys a reverse tunnel through multistage intrusion — https://www.microsoft.com/en-us/security/blog/2026/08/28/terminalfix-campaign-deploys-reverse-tunnel-through-multistage-intrusion/
+> [3] ownCloud Flaw Exploited to Steal Nuclear Records From Philippine Research Body — https://thehackernews.com/2026/08/snowflake-github-actions-flaw-lets.html
+> [4] China-Made ZBT Routers Ship With Two Implants Giving Unauthenticated Attackers Root Access — https://thehackernews.com/2026/08/china-made-zbt-routers-ship-with-two.html
+> [6] PaperCut Zero-Day Exploited in Attacks, Affecting All NG and MF Versions — https://thehackernews.com/2026/08/papercut-zero-day-exploited-in-attacks.html
+> [7] APT28-Linked HOOKEDGE Backdoor Targets European Government and Diplomatic Organizations — https://thehackernews.com/2026/08/apt28-linked-hookedge-backdoor-targets.html
