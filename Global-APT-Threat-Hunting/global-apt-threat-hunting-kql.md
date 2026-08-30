@@ -4899,3 +4899,126 @@ DeviceProcessEvents
 > [4] China-Made ZBT Routers Ship With Two Implants Giving Unauthenticated Attackers Root Access — https://thehackernews.com/2026/08/china-made-zbt-routers-ship-with-two.html
 > [6] PaperCut Zero-Day Exploited in Attacks, Affecting All NG and MF Versions — https://thehackernews.com/2026/08/papercut-zero-day-exploited-in-attacks.html
 > [7] APT28-Linked HOOKEDGE Backdoor Targets European Government and Diplomatic Organizations — https://thehackernews.com/2026/08/apt28-linked-hookedge-backdoor-targets.html
+
+### 2026-08-30
+
+*Generated 2026-08-30 13:21 UTC · model `claude-sonnet-5`*
+
+_Lint: 5 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Windows Terminal / PowerShell Spawned with ClickFix-style Web Fetch Command
+- **Actor / Campaign:** TerminalFix (ClickFix variant)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste (via ClickFix social engineering); T1059.001 — PowerShell
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// TerminalFix directs victims to paste attacker-supplied commands into
+// Windows Terminal / PowerShell rather than the classic Run dialog.
+// Look for wt.exe / WindowsTerminal.exe / OpenConsole.exe launching
+// powershell/cmd with web-download or encoded-command patterns.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("WindowsTerminal.exe", "wt.exe", "OpenConsole.exe")
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "mshta.exe", "curl.exe")
+| where ProcessCommandLine has_any (
+    "iwr", "Invoke-WebRequest", "irm", "Invoke-RestMethod",
+    "DownloadString", "-enc", "-EncodedCommand", "FromBase64String",
+    "curl.exe -o", "certutil -decode"
+)
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Windows Terminal is a legitimate default shell host, so tune out admin scripting/automation; focus on interactive user sessions and correlate with a recent browser process (msedge.exe/chrome.exe) in the process tree ancestry.
+
+#### PowerShell/CMD Launched Directly from Explorer via Clipboard-Paste Pattern into Terminal
+- **Actor / Campaign:** TerminalFix (ClickFix variant)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste; T1218 — System Binary Proxy Execution
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// ClickFix/TerminalFix lures often have explorer.exe (user interaction with
+// a fake CAPTCHA page/instructions) as grandparent of a Terminal session
+// that immediately runs a suspicious one-liner.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("WindowsTerminal.exe", "wt.exe")
+| where InitiatingProcessFileName =~ "explorer.exe"
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+    | where ProcessCommandLine has_any ("http://", "https://", "-w hidden", "-windowstyle hidden", "IEX")
+    | project ChildTimestamp = Timestamp, DeviceName, ChildCmd = ProcessCommandLine, InitiatingProcessParentFileName
+) on DeviceName
+| where ChildTimestamp between (Timestamp .. (Timestamp + 2m))
+| project Timestamp, ChildTimestamp, DeviceName, ChildCmd
+| take 100
+```
+
+*Note:* Heuristic time-window correlation between explorer→Terminal launch and a follow-on suspicious shell command; expect noise in dev/IT-admin environments, tune the 2-minute window and command-line filters to your baseline.
+
+#### Reverse-Tunnel Client Execution (ngrok/cloudflared/SSH -R) Following Terminal Launch
+- **Actor / Campaign:** TerminalFix (ClickFix variant)
+- **MITRE ATT&CK:** T1572 — Protocol Tunneling; T1071 — Application Layer Protocol
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// TerminalFix deploys a reverse-tunnel backdoor; look for common tunneling
+// binaries executed shortly after a terminal/PowerShell session begins.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName has_any ("ngrok.exe", "cloudflared.exe", "frpc.exe", "chisel.exe", "plink.exe", "ssh.exe")
+   or ProcessCommandLine has_any ("ssh -R", "ssh -L", "-R 0.0.0.0", "tunnel run", "ngrok tcp", "ngrok http")
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "WindowsTerminal.exe", "wt.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No specific tunnel-tool binary names or hashes were published in the source; this is behavior-based and legitimate remote-access/DevOps tooling will trigger it, so allow-list known IT usage.
+
+#### Suspicious New Outbound Connections to Tunneling/Dynamic-DNS Infrastructure After Terminal Session
+- **Actor / Campaign:** TerminalFix (ClickFix variant)
+- **MITRE ATT&CK:** T1572 — Protocol Tunneling; T1105 — Ingress Tool Transfer
+- **Data source:** DeviceNetworkEvents, DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// Generic heuristic: correlate a Windows Terminal / PowerShell process
+// making an outbound connection to known reverse-tunnel provider domains.
+// No campaign-specific C2 domains were published; tune the domain list to
+// your environment's known-bad/allow-list.
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "WindowsTerminal.exe", "wt.exe")
+| where RemoteUrl has_any ("trycloudflare.com", "ngrok.io", "ngrok-free.app", "loca.lt", "localhost.run")
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteUrl, RemoteIP, RemotePort
+| take 100
+```
+
+*Note:* trycloudflare.com/ngrok domains are widely used for legitimate free tunneling as well as abuse; treat as a low-confidence pivot to enrich other alerts rather than a standalone high-fidelity detection.
+
+#### Registry/MRU Evidence of Manual Run-Box or Terminal Command Entry Preceding Compromise
+- **Actor / Campaign:** TerminalFix (ClickFix variant)
+- **MITRE ATT&CK:** T1204.004 — User Execution; T1112 — Modify Registry
+- **Data source:** DeviceRegistryEvents
+- **Source:** [1]
+
+```kql
+// Classic ClickFix leaves RunMRU artifacts; TerminalFix targets Terminal/
+// PowerShell instead, but some victims may still be redirected via Run
+// first. Flag RunMRU entries containing PowerShell/mshta/curl indicators.
+DeviceRegistryEvents
+| where Timestamp > ago(7d)
+| where RegistryKey has @"Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU"
+| where RegistryValueData has_any ("powershell", "mshta", "curl", "certutil", "iex", "http")
+| project Timestamp, DeviceName, RegistryKey, RegistryValueName, RegistryValueData
+| take 100
+```
+
+*Note:* Complementary detection covering the original ClickFix Run-dialog vector referenced as the baseline that TerminalFix evolves from; expect some legitimate admin RunMRU entries, review case-by-case.
+
+> [1] TerminalFix Uses Fake Cloudflare CAPTCHAs to Deploy Reverse-Tunnel Backdoor — https://thehackernews.com/2026/08/terminalfix-uses-fake-cloudflare.html
