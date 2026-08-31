@@ -5022,3 +5022,141 @@ DeviceRegistryEvents
 *Note:* Complementary detection covering the original ClickFix Run-dialog vector referenced as the baseline that TerminalFix evolves from; expect some legitimate admin RunMRU entries, review case-by-case.
 
 > [1] TerminalFix Uses Fake Cloudflare CAPTCHAs to Deploy Reverse-Tunnel Backdoor — https://thehackernews.com/2026/08/terminalfix-uses-fake-cloudflare.html
+
+### 2026-08-31
+
+*Generated 2026-08-31 13:27 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### ValleyRAT Loader Disguised as QN Wallpaper Adware
+- **Actor / Campaign:** Silver Fox / ValleyRAT
+- **MITRE ATT&CK:** T1036.005 — Masquerading: Match Legitimate Name or Location
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [1] [3]
+
+```kql
+// QN Wallpaper / adware binaries spawning unexpected child processes (loader chain to ValleyRAT)
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("QNWallpaper", "QN_Wallpaper", "wallpaper") // adjust to observed binary name
+| where FileName in~ ("rundll32.exe","regsvr32.exe","powershell.exe","cmd.exe","mshta.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Kaspersky's report [3] describes ValleyRAT running under a signed, trusted adware process; the exact binary/hash was not published, so this hunts on behavioral parent/child anomalies from wallpaper/adware utilities — tune the `InitiatingProcessFileName` filter once the exact signed binary name is confirmed in your environment.
+
+#### Defender Antivirus Exclusion Added for Adware/Trusted-Process Path
+- **Actor / Campaign:** Silver Fox / ValleyRAT
+- **MITRE ATT&CK:** T1562.001 — Impair Defenses: Disable or Modify Tools
+- **Data source:** DeviceProcessEvents
+- **Source:** [1] [3]
+
+```kql
+// User or script adding an AV exclusion for a path/process associated with adware-style installers
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "powershell.exe"
+| where ProcessCommandLine has "Add-MpPreference" and ProcessCommandLine has_any ("ExclusionPath", "ExclusionProcess")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Legitimate IT/software installers sometimes add exclusions; correlate with recent installation of unfamiliar adware/wallpaper utilities from [1][3] rather than alerting on this alone.
+
+#### Cursor AI Coding Assistant Executed Outside Developer Context
+- **Actor / Campaign:** Aurora / Aur0ra ransomware
+- **MITRE ATT&CK:** T1588.002 — Obtain Capability: Tool (abuse of legitimate AI coding tool)
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+// Behavioral hunt: Cursor AI binary running on hosts with no prior developer/IDE activity
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName has_any ("Cursor.exe","cursor-agent","cursor.exe")
+| summarize FirstSeen = min(Timestamp), Executions = count(), Devices = make_set(DeviceName) by AccountName, FileName
+| where Executions < 5
+| take 100
+```
+
+```kql
+// Follow-on: Cursor process making outbound connections shortly before ransomware-style file activity
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("Cursor.exe","cursor-agent")
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* No concrete IOCs (hashes/IPs/domains) were published for the Aurora/Cursor campaign [2]; this is a purely behavioral hunt intended to surface anomalous Cursor AI usage for manual triage, and will need suppression for legitimate developer workstations.
+
+#### Cisco IOS XR / TACACS Device Logging Disabled or Cleared
+- **Actor / Campaign:** Fire Ant (China-nexus)
+- **MITRE ATT&CK:** T1562.002 — Impair Defenses: Disable Windows Event Logging (analogous network-device logging), T1556 — Modify Authentication Process
+- **Data source:** Syslog, CommonSecurityLog
+- **Source:** [4]
+
+```kql
+// Hunt for commands/events indicating log-blinding or config tampering on network infrastructure
+Syslog
+| where TimeGenerated > ago(14d)
+| where ProcessName has_any ("clear logging","no logging","logging buffered 0","clear tacacs","tac_plus")
+   or SyslogMessage has_any ("clear logging","no logging host","tacacs-server key")
+| project TimeGenerated, Computer, Facility, SeverityLevel, SyslogMessage
+| take 100
+```
+
+```kql
+// Repeated authentication events against TACACS servers from unexpected management hosts
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor has "Cisco" and Activity has_any ("tacacs","aaa","authentication")
+| summarize AuthAttempts = count(), Users = make_set(SourceUserName) by SourceIP, DestinationIP, DeviceAction
+| where AuthAttempts > 20
+| take 100
+```
+
+*Note:* No specific IOCs (device hostnames, IPs) were disclosed for Fire Ant [4]; these queries rely on syslog/CommonSecurityLog ingestion from Cisco IOS XR/TACACS devices being configured in Sentinel, and thresholds need tuning to your network's baseline logging volume.
+
+#### TerminalFix ClickFix — Windows Terminal/PowerShell Launched via Clipboard Paste from Fake CAPTCHA
+- **Actor / Campaign:** TerminalFix (ClickFix variant, unattributed)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste; T1059.001 — Command and Scripting Interpreter: PowerShell
+- **Data source:** DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+// Windows Terminal or PowerShell spawned directly by explorer.exe with encoded/remote-fetch commands (ClickFix pattern)
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where FileName in~ ("WindowsTerminal.exe","wt.exe","powershell.exe","pwsh.exe")
+| where ProcessCommandLine has_any ("iwr ","Invoke-WebRequest","curl ","-enc ","-EncodedCommand","irm ")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+#### Reverse-Tunnel Backdoor Tooling Launched from Terminal/PowerShell Session
+- **Actor / Campaign:** TerminalFix
+- **MITRE ATT&CK:** T1572 — Protocol Tunneling
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [6]
+
+```kql
+// Reverse-tunnel client (e.g., cloudflared, ngrok) started from a Terminal/PowerShell chain shortly after ClickFix-style execution
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("WindowsTerminal.exe","wt.exe","powershell.exe","pwsh.exe")
+| where FileName has_any ("cloudflared.exe","ngrok.exe","frpc.exe","ssh.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* [6] describes the TerminalFix technique directing victims to paste commands into Windows Terminal/PowerShell rather than the Run dialog; no specific payload hashes/domains were published, so these are behavioral hunts on the execution chain and should be tuned against legitimate developer/IT use of Windows Terminal and tunneling tools.
+
+> [1] ValleyRAT Backdoor Hides in Signed Adware That Users Add to Antivirus Exclusions — https://thehackernews.com/2026/08/valleyrat-backdoor-hides-in-signed.html
+> [2] Aurora Ransomware Operators Use Cursor AI in Attacks Against 10 Targets — https://thehackernews.com/2026/08/aurora-ransomware-operators-use-cursor.html
+> [3] ValleyRAT masquerading as adware — https://securelist.com/valleyrat-backdoor-adware/121175/
+> [4] China-Linked Fire Ant Hijacks Cisco Routers to Steal Credentials and Blind Security Logs — https://thehackernews.com/2026/08/china-linked-fire-ant-hijacks-cisco.html
+> [6] TerminalFix Uses Fake Cloudflare CAPTCHAs to Deploy Reverse-Tunnel Backdoor — https://thehackernews.com/2026/08/terminalfix-uses-fake-cloudflare.html
