@@ -5160,3 +5160,189 @@ DeviceProcessEvents
 > [3] ValleyRAT masquerading as adware — https://securelist.com/valleyrat-backdoor-adware/121175/
 > [4] China-Linked Fire Ant Hijacks Cisco Routers to Steal Credentials and Blind Security Logs — https://thehackernews.com/2026/08/china-linked-fire-ant-hijacks-cisco.html
 > [6] TerminalFix Uses Fake Cloudflare CAPTCHAs to Deploy Reverse-Tunnel Backdoor — https://thehackernews.com/2026/08/terminalfix-uses-fake-cloudflare.html
+
+### 2026-09-01
+
+*Generated 2026-09-01 13:27 UTC · model `claude-sonnet-5`*
+
+_Lint: 11 KQL block(s) — query 1: unbalanced '()'. All queries are CANDIDATES; validate before use._
+
+#### ClickFix-Style Initial Access via Clipboard-Paste Terminal Execution
+- **Actor / Campaign:** Unattributed (Microsoft telemetry, most common 2025 initial access technique)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste / T1059.001 — PowerShell
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName in~ ("explorer.exe","RuntimeBroker.exe")
+| where FileName in~ ("powershell.exe","pwsh.exe","cmd.exe","wt.exe")
+| where ProcessCommandLine has_any ("iwr ", "Invoke-WebRequest", "irm ", "Invoke-RestMethod", "certutil", "-enc", "-EncodedCommand", "iex(")
+// ClickFix lures typically invoke Run dialog / clipboard-paste then a one-liner download+execute
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Heuristic — Run-dialog-to-shell chains are common in legitimate admin activity too; tune by excluding known IT-admin accounts/scripts and correlate with recent browser process activity on the same host.
+
+#### TerminalFix: Windows Terminal Spawning Reverse-Tunnel Utilities
+- **Actor / Campaign:** TerminalFix (ClickFix variant, per Microsoft)
+- **MITRE ATT&CK:** T1090 — Proxy / T1572 — Protocol Tunneling
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [6]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName =~ "wt.exe" or InitiatingProcessFileName =~ "OpenConsole.exe"
+| where FileName in~ ("powershell.exe","pwsh.exe","cmd.exe")
+| where ProcessCommandLine has_any ("cloudflared", "ssh -R", "ssh -L", "chisel", "ngrok", "-R 0.0.0.0", "tunnel")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Cloudflare-CAPTCHA lures on compromised sites drive victims to run these commands via Windows Terminal specifically (not classic console host); validate wt.exe parentage and absence of legitimate dev tunnel use in your environment.
+
+#### PaperCut Server Process Spawning Unexpected Child Processes (Post-Auth-Bypass RCE Chain)
+- **Actor / Campaign:** Unattributed exploitation of CVE-2026-81578/82078
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [4] [10] [15] [16]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName in~ ("pc-app.exe","PaperCutNGMFService.exe","java.exe")
+| where InitiatingProcessCommandLine has_any ("papercut","PaperCut")
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","whoami.exe","net.exe","certutil.exe","curl.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Chained missing-authentication (CVE-2026-81578) + unsafe reflection (CVE-2026-82078) grants arbitrary Java execution under the PaperCut server process; any shell/child-process activity from that process on a print server is highly suspicious. Confirm PaperCut is patched and check for pre-patch compromise per BOD 26-04 forensic triage guidance.
+
+#### Langflow / Ruby on Rails RCE Exploitation Leading to Shell or C2 Activity
+- **Actor / Campaign:** Unattributed (VulnCheck reporting, CVE-2026-0768 / CVE-2026-66066)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [5]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName in~ ("python.exe","python3.exe","ruby.exe","puma.exe","langflow.exe")
+| where FileName in~ ("bash","sh","cmd.exe","powershell.exe","curl","wget","nc","ncat")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName in~ ("python.exe","python3.exe","ruby.exe","puma.exe","langflow.exe")
+| where RemotePort in (4444, 1337, 8443) or isnotempty(RemoteUrl)
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemotePort, RemoteUrl
+| take 100
+```
+
+*Note:* No concrete IOCs published; these are behavioral guards for a Langflow/Rails process unexpectedly spawning a shell or making outbound C2-style connections. Tune port list and add known internal automation exceptions.
+
+#### ValleyRAT Masquerading as Signed Adware with AV Exclusion Abuse
+- **Actor / Campaign:** Silver Fox / ValleyRAT
+- **MITRE ATT&CK:** T1562.001 — Impair Defenses: Disable or Modify Tools / T1036.005 — Masquerading (Match Legitimate Name or Location)
+- **Data source:** DeviceProcessEvents, DeviceRegistryEvents
+- **Source:** [9] [12]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where FileName =~ "powershell.exe"
+| where ProcessCommandLine has "Add-MpPreference" and ProcessCommandLine has_any ("ExclusionPath", "ExclusionProcess")
+| where ProcessCommandLine has_any ("Wallpaper", "QN", "adware","wallpaper")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine
+| take 100
+```
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where ProcessVersionInfoProductName has_any ("Wallpaper","QN Wallpaper") or FileName has_any ("wallpaper","QNWallpaper")
+| where isnotempty(InitiatingProcessSignerType) and InitiatingProcessSignerType != "OSVendor"
+| project Timestamp, DeviceName, FileName, ProcessVersionInfoProductName, SHA256, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Behavioral, no confirmed hashes provided — the key signal is a signed "wallpaper/adware" utility being manually excluded from AV, followed by process hollowing/loading of an unsigned backdoor under its trusted name; validate against your allowed-software list.
+
+#### Fire Ant: Log-Clearing / Config Changes on Cisco IOS-XR, TACACS, or Linux Management Hosts
+- **Actor / Campaign:** Fire Ant (China-nexus)
+- **MITRE ATT&CK:** T1070.002 — Indicator Removal: Clear Linux or Mac System Logs / T1556 — Modify Authentication Process
+- **Data source:** CommonSecurityLog, SecurityEvent, DeviceProcessEvents
+- **Source:** [13]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(1d)
+| where DeviceVendor has_any ("Cisco","TACACS") 
+| where Activity has_any ("clear logging","no logging","configuration changed","tacacs")
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, Activity, Message
+| take 100
+```
+
+```kql
+SecurityEvent
+| where TimeGenerated > ago(1d)
+| where EventID in (1102, 4719) // audit log cleared / audit policy changed on Linux mgmt hosts forwarding Windows-style events, or bastion jump hosts
+| project TimeGenerated, Computer, Account, EventID, Activity
+| take 100
+```
+
+*Note:* Environment must ingest Cisco IOS-XR / TACACS syslog into CommonSecurityLog for the first query to fire; adjust field/activity matching to your actual log-forwarding schema since router/TACACS log-blinding behavior is not natively visible in Defender XDR tables.
+
+#### Aurora Ransomware Operators Leveraging Cursor AI Coding Assistant for Intrusion Tooling
+- **Actor / Campaign:** Aurora / Aur0ra ransomware
+- **MITRE ATT&CK:** T1588.002 — Obtain Capabilities: Tool / T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [11]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where FileName has_any ("Cursor.exe","cursor-agent.exe","cursor.exe")
+| where ProcessCommandLine has_any ("powershell","cmd.exe","-enc","Invoke-","download")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Cursor is a legitimate AI coding tool; flag only unusual server-side or non-developer-host installs/executions paired with scripting activity, since normal developer usage will cause high false positives — restrict to servers/endpoints where Cursor is not expected.
+
+#### METR-Style API Key Theft Leading to Anomalous AI Service Consumption
+- **Actor / Campaign:** Unattributed (METR incident)
+- **MITRE ATT&CK:** T1552.001 — Unsecured Credentials: Credentials In Files / T1078.004 — Valid Accounts: Cloud Accounts
+- **Data source:** CloudAppEvents, DeviceFileEvents
+- **Source:** [2]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(1d)
+| where FileName has_any (".env", "credentials.json", "api_key", "config.yaml")
+| where ActionType in ("FileCreated","FileModified")
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* No specific IOCs disclosed; this is a generic hunt for locally stored API-key/secret files that could be harvested and abused for cloud/AI-service credit theft — pair with billing/usage anomaly alerts from your AI vendor where available.
+
+> [1] Threat Actors Don’t Want Better Attacks. They Want Repeatable Ones — https://thehackernews.com/2026/09/threat-actors-dont-want-better-attacks.html
+> [2] Attackers Steal METR API Key and Consume AI Credits Worth About $600,000 — https://thehackernews.com/2026/09/attackers-steal-metr-api-key-and.html
+> [4] Recently patched PaperCut zero-days used in data theft attacks — https://www.bleepingcomputer.com/news/security/recently-patched-papercut-zero-days-used-in-data-theft-attacks/
+> [5] Attackers Exploit Critical Langflow and Rails Flaws in Credential-Probing and C2 Activity — https://thehackernews.com/2026/09/attackers-exploit-critical-langflow-and.html
+> [6] Microsoft warns of TerminalFix attacks deploying reverse tunnels — https://www.bleepingcomputer.com/news/security/microsoft-warns-of-terminalfix-attacks-deploying-reverse-tunnels/
+> [9] ValleyRAT Backdoor Hides in Signed Adware That Users Add to Antivirus Exclusions — https://thehackernews.com/2026/08/valleyrat-backdoor-hides-in-signed.html
+> [10] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/08/31/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [11] Aurora Ransomware Operators Use Cursor AI in Attacks Against 10 Targets — https://thehackernews.com/2026/08/aurora-ransomware-operators-use-cursor.html
+> [12] ValleyRAT masquerading as adware — https://securelist.com/valleyrat-backdoor-adware/121175/
+> [13] China-Linked Fire Ant Hijacks Cisco Routers to Steal Credentials and Blind Security Logs — https://thehackernews.com/2026/08/china-linked-fire-ant-hijacks-cisco.html
+> [15] CVE-2026-82078 — PaperCut NG/MF Unsafe Reflection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-82078
+> [16] CVE-2026-81578 — PaperCut NG/MF Missing Authentication for Critical Function Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-81578
