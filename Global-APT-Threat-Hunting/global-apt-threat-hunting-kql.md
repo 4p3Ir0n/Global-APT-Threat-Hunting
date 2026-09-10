@@ -5346,3 +5346,206 @@ DeviceFileEvents
 > [13] China-Linked Fire Ant Hijacks Cisco Routers to Steal Credentials and Blind Security Logs — https://thehackernews.com/2026/08/china-linked-fire-ant-hijacks-cisco.html
 > [15] CVE-2026-82078 — PaperCut NG/MF Unsafe Reflection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-82078
 > [16] CVE-2026-81578 — PaperCut NG/MF Missing Authentication for Critical Function Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-81578
+
+### 2026-09-10
+
+*Generated 2026-09-10 13:25 UTC · model `claude-sonnet-5`*
+
+_Lint: 9 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Trezor-branded phishing email lures post email-provider breach
+- **Actor / Campaign:** unattributed (Trezor customer email breach)
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link
+- **Data source:** EmailEvents, EmailUrlInfo
+- **Source:** [1]
+
+```kql
+EmailEvents
+| where Timestamp > ago(3d)
+| where SenderDisplayName has_any ("Trezor", "SatoshiLabs") or Subject has_any ("Trezor", "wallet recovery", "seed phrase", "security update")
+| join kind=inner (EmailUrlInfo) on NetworkMessageId
+| where UrlDomain !has "trezor.io"
+| where UrlDomain has_any ("trezor", "wallet", "recovery", "secure-login")
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject, UrlDomain, Url
+| take 100
+```
+
+*Note:* Heuristic — matches Trezor-themed phishing terminology combined with look-alike domains; tune domain list as actual campaign URLs surface and validate against Trezor's real domain allow-list.
+
+#### New passkey/FIDO2 registration followed by anomalous sign-in (MFA persistence)
+- **Actor / Campaign:** unattributed — passkey social-engineering campaigns
+- **MITRE ATT&CK:** T1556.006 — Modify Authentication Process: Multi-Factor Authentication, T1098.005 — Account Manipulation: Device Registration
+- **Data source:** AuditLogs, SigninLogs
+- **Source:** [4]
+
+```kql
+AuditLogs
+| where Timestamp > ago(3d)
+| where OperationName in ("Register security info", "User registered security info", "Add registration method")
+| extend UserId = tostring(TargetResources[0].id), UserPrincipalName = tostring(TargetResources[0].userPrincipalName)
+| join kind=inner (
+    SigninLogs
+    | where Timestamp > ago(3d)
+    | where ResultType == 0
+    | where AuthenticationRequirement == "singleFactorAuthentication" or isnotempty(ConditionalAccessStatus)
+) on $left.UserPrincipalName == $right.UserPrincipalName
+| where SigninLogs_Timestamp between (Timestamp .. (Timestamp + 1h))
+| project Timestamp, UserPrincipalName, IPAddress, Location = tostring(LocationDetails), AppDisplayName, DeviceDetail
+| take 100
+```
+
+*Note:* Flags a new authentication method registration closely followed by sign-in from potentially new device/location; expect FPs for legitimate self-service MFA re-enrollment — correlate with new/unfamiliar IP or device.
+
+#### Suspicious Microsoft Graph enumeration following identity compromise
+- **Actor / Campaign:** unattributed — passkey-themed social engineering
+- **MITRE ATT&CK:** T1087.004 — Account Discovery: Cloud Account, T1213.002 — Data from Information Repositories: SharePoint
+- **Data source:** CloudAppEvents, OfficeActivity
+- **Source:** [4]
+
+```kql
+CloudAppEvents
+| where Timestamp > ago(3d)
+| where Application == "Microsoft Graph"
+| where ActionType in ("List users", "List sites", "List drives", "Get user", "Get mailbox settings")
+| summarize DistinctActions = dcount(ActionType), Calls = count() by AccountId, IPAddress, bin(Timestamp, 1h)
+| where DistinctActions >= 3 and Calls > 20
+| project Timestamp, AccountId, IPAddress, DistinctActions, Calls
+| take 100
+```
+
+*Note:* Heuristic burst-detection for reconnaissance-style Graph API calls; tune thresholds per tenant baseline and pair with SharePoint/OneDrive mass-download alerts described in the report.
+
+#### Mass SharePoint/OneDrive access shortly after suspicious sign-in
+- **Actor / Campaign:** unattributed — passkey-themed social engineering
+- **MITRE ATT&CK:** T1530 — Data from Cloud Storage
+- **Data source:** OfficeActivity, SigninLogs
+- **Source:** [4]
+
+```kql
+OfficeActivity
+| where TimeGenerated > ago(3d)
+| where Operation in ("FileDownloaded", "FileAccessed", "FileSyncDownloadedFull")
+| summarize FileOps = count(), DistinctFiles = dcount(OfficeObjectId) by UserId, ClientIP, bin(TimeGenerated, 1h)
+| where DistinctFiles > 50
+| project TimeGenerated, UserId, ClientIP, FileOps, DistinctFiles
+| take 100
+```
+
+*Note:* Candidate for post-compromise mass exfiltration from SharePoint/OneDrive; tune volume thresholds to org baselines to avoid FPs from legitimate bulk sync jobs.
+
+#### Chrome renderer spawning unexpected child process (possible BlueMoon/V8 exploit chain)
+- **Actor / Campaign:** APT31 and other espionage clusters using BlueMoon exploit kit
+- **MITRE ATT&CK:** T1203 — Exploitation for Client Execution, T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents
+- **Source:** [5][8][12]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(3d)
+| where InitiatingProcessFileName =~ "chrome.exe"
+| where FileName in~ ("rundll32.exe","mshta.exe","powershell.exe","cmd.exe","wscript.exe","cscript.exe","regsvr32.exe")
+| where InitiatingProcessParentFileName !in~ ("chrome.exe") // rule out normal update helpers, tune as needed
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Behavioral only — no IOCs published for BlueMoon; Chrome legitimately spawns some helper processes (e.g., installer, notification helper), so expect FPs — validate against known-good Chrome child process baseline before alerting.
+
+#### Chrome crash/respawn pattern consistent with CVE-2026-87491 exploitation
+- **Actor / Campaign:** unattributed espionage clusters (BlueMoon exploit kit)
+- **MITRE ATT&CK:** T1203 — Exploitation for Client Execution
+- **Data source:** DeviceProcessEvents, DeviceEvents
+- **Source:** [5][8][12]
+
+```kql
+DeviceEvents
+| where Timestamp > ago(3d)
+| where ActionType has_any ("ProcessCrashed","ApplicationCrash")
+| where AdditionalFields has "chrome.exe"
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(3d)
+    | where FileName =~ "chrome.exe"
+) on DeviceId
+| where DeviceProcessEvents_Timestamp between (Timestamp .. (Timestamp + 5m))
+| project Timestamp, DeviceName, ActionType, AdditionalFields
+| take 100
+```
+
+*Note:* Column/table names for crash telemetry vary by sensor version — validate ActionType values in your tenant; unpatched CVE-2026-87491 (fixed in Chrome update referenced in [8]) is the priority mitigation, this hunt is supplementary.
+
+#### Microsoft Defender process crash preceding unexpected SYSTEM-level process (ShieldCrash pattern)
+- **Actor / Campaign:** "Nightmare Eclipse" — ShieldCrash Defender LPE exploit
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents, DeviceEvents
+- **Source:** [9]
+
+```kql
+DeviceEvents
+| where Timestamp > ago(3d)
+| where FileName has_any ("MsMpEng.exe","MpCmdRun.exe","MpDefenderCoreService.exe")
+| where ActionType has_any ("ProcessCrashed","ServiceCrashed","AntimalwareServiceError")
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(3d)
+    | where AccountName has_any ("SYSTEM","NT AUTHORITY\\SYSTEM")
+) on DeviceId
+| where DeviceProcessEvents_Timestamp between (Timestamp .. (Timestamp + 5m))
+| project Timestamp, DeviceName, ActionType, DeviceProcessEvents_Timestamp, FileName1 = FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* No public IOC/command-line for the "ShieldCrash" exploit exists yet — this is a coarse behavioral proxy (Defender component crash immediately followed by new SYSTEM process creation); expect noise from normal Defender maintenance/updates and refine once PoC details/hashes emerge.
+
+#### Authentication success without expected MFA challenge on Citrix NetScaler Gateway (CVE-2026-19490)
+- **Actor / Campaign:** unattributed — active KEV exploitation
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application, T1556 — Modify Authentication Process
+- **Data source:** CommonSecurityLog (Citrix NetScaler syslog/CEF)
+- **Source:** [6][10]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(3d)
+| where DeviceVendor has "Citrix" and DeviceProduct has_any ("NetScaler","Gateway")
+| where Activity has_any ("AAA_LOGIN_SUCCESS","AUTHENTICATION")
+| where isnotempty(SourceIP) and isempty(AdditionalExtensions) // no MFA/second-factor field logged
+| summarize LoginCount = count() by SourceIP, DestinationIP, Activity, bin(TimeGenerated, 1h)
+| where LoginCount > 5
+| take 100
+```
+
+*Note:* Field names depend on your Citrix CEF/syslog mapping — validate against your parser; this is a coarse heuristic for unauthenticated-bypass style logins and should be paired with immediate patching per CISA KEV/BOD 26-04.
+
+#### Anomalous administrative access to Cisco FMC/SCC (CVE-2026-20079) or FortiOS (CVE-2025-25249)
+- **Actor / Campaign:** unattributed — active KEV exploitation
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (Cisco FMC/ASA, Fortinet syslog)
+- **Source:** [6][11][13]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(3d)
+| where (DeviceVendor has "Cisco" and DeviceProduct has_any ("FMC","Firepower")) 
+      or (DeviceVendor has "Fortinet" and DeviceProduct has_any ("FortiOS","FortiGate"))
+| where Activity has_any ("Login","admin","config change","account created") 
+| where SourceIP !in ( 
+    // known-good management/jump-host IP ranges — populate per environment
+    dynamic([])
+)
+| summarize Events = count() by SourceIP, DeviceProduct, Activity, bin(TimeGenerated, 1h)
+| where Events > 3
+| take 100
+```
+
+*Note:* Purely behavioral placeholder due to lack of exploit-specific indicators in the advisory; prioritize vendor patching per CISA KEV/BOD 26-04 and tune the known-good IP allowlist to your environment to reduce noise.
+
+> [1] Trezor warns users of email provider breach, phishing attacks — https://www.bleepingcomputer.com/news/security/trezor-warns-users-of-email-provider-breach-phishing-attacks/
+> [4] Passkey-themed social engineering leads to identity and cloud compromise — https://www.microsoft.com/en-us/security/blog/2026/09/09/passkey-themed-social-engineering-leads-identity-cloud-compromise/
+> [5] Four Spy Groups Used the Same Chrome and Windows Exploit Kit Within a Week — https://thehackernews.com/2026/09/four-spy-groups-used-same-chrome-and.html
+> [6] CISA Adds Four Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/09/cisa-adds-four-known-exploited-vulnerabilities-catalog
+> [8] Chrome V8 Zero-Day Exploited in the Wild Enables Code Execution Inside Sandbox — https://thehackernews.com/2026/09/chrome-v8-zero-day-exploited-in-wild.html
+> [9] New Microsoft Defender 'ShieldCrash' zero-day grants SYSTEM access — https://www.bleepingcomputer.com/news/security/new-microsoft-defender-shieldcrash-zero-day-grants-system-access/
+> [10] CVE-2026-19490 — Citrix NetScaler Authentication Bypass Using an Alternate Path or Channel Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-19490
+> [11] CVE-2025-25249 — Fortinet Multiple Products Heap-based Buffer Overflow Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2025-25249
+> [12] CVE-2026-87491 — Google Chromium V8 Out of Bounds Write Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-87491
+> [13] CVE-2026-20079 — Cisco Firewall Management Center Authentication Bypass Using an Alternate Path or Channel Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-20079
