@@ -5549,3 +5549,164 @@ CommonSecurityLog
 > [11] CVE-2025-25249 — Fortinet Multiple Products Heap-based Buffer Overflow Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2025-25249
 > [12] CVE-2026-87491 — Google Chromium V8 Out of Bounds Write Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-87491
 > [13] CVE-2026-20079 — Cisco Firewall Management Center Authentication Bypass Using an Alternate Path or Channel Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-20079
+
+### 2026-09-11
+
+*Generated 2026-09-11 13:26 UTC · model `claude-sonnet-5`*
+
+_Lint: 9 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Suspicious Child Process Execution from JFrog Artifactory Service
+- **Actor / Campaign:** Unattributed (opportunistic exploitation of JFrog Artifactory CVEs)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("java.exe", "artifactory.exe", "artifactoryservice.exe")
+    or InitiatingProcessFolderPath has "artifactory"
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "bash.exe", "sh", "curl.exe", "wget.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Artifactory runs on Java and normally does not spawn shells; any such child process on a self-hosted Artifactory server warrants review, especially if paired with new local/admin account creation shortly after. Tune for legitimate CI/CD scripts that shell out from Artifactory plugins.
+
+#### Suspicious Process/Network Activity from Sogou Input Method (GRAYRABBIT)
+- **Actor / Campaign:** UNC3569 (China-linked) — GRAYRABBIT backdoor
+- **MITRE ATT&CK:** T1203 — Exploitation for Client Execution; T1105 — Ingress Tool Transfer
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("SogouCloud.exe", "SGTool.exe", "SogouPY.exe", "SogouIME.exe", "sogouinput.exe")
+| where FileName in~ ("cmd.exe", "powershell.exe", "rundll32.exe", "mshta.exe", "regsvr32.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("SogouCloud.exe", "SGTool.exe", "SogouPY.exe", "SogouIME.exe")
+| where RemotePort in (80, 443, 8080)
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* No specific IOCs (hashes/domains) were published; this is behavioral coverage for abuse of the Sogou IME process tree following exploitation of a crafted link. Expect noise from legitimate Sogou cloud-sync/update behavior — validate against known-good update endpoints before alerting.
+
+#### Ransomware Pre-Encryption Indicators Following Cisco FMC Exploitation (Qilin)
+- **Actor / Campaign:** Qilin ransomware + unnamed state-sponsored clusters exploiting CVE-2026-20079 (Cisco FMC)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1490 — Inhibit System Recovery
+- **Data source:** DeviceProcessEvents
+- **Source:** [4] [9]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("vssadmin.exe", "wmic.exe", "bcdedit.exe", "wbadmin.exe")
+| where ProcessCommandLine has_any (
+    "delete shadows", "resize shadowstorage", "recoveryenabled no",
+    "bootstatuspolicy ignoreallfailures", "delete catalog")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Cisco FMC itself is not visible in Defender/Sentinel host telemetry; this query hunts for the post-compromise shadow-copy/backup-tampering stage that typically follows credential theft via the CVE-2026-20079 auth-bypass chain. Pair with firewall/VPN sign-in anomaly hunting (SigninLogs, CommonSecurityLog) for admin accounts newly authenticating from unusual IPs after FMC exposure dates.
+
+#### Anomalous Admin Sign-ins Possibly Linked to Cisco FMC Credential Theft
+- **Actor / Campaign:** Ransomware / state-sponsored clusters exploiting CVE-2026-20079, CVE-2026-* (Cisco FMC)
+- **MITRE ATT&CK:** T1078 — Valid Accounts; T1556 — Modify Authentication Process
+- **Data source:** SigninLogs, IdentityLogonEvents
+- **Source:** [4] [9]
+
+```kql
+SigninLogs
+| where TimeGenerated > ago(14d)
+| where ResultType == 0
+| where AppDisplayName has_any ("VPN", "Firewall", "Network")
+| summarize Countries = dcount(tostring(LocationDetails.countryOrRegion)), Attempts = count() by UserPrincipalName
+| where Countries > 1
+| take 100
+```
+
+*Note:* Heuristic only — flags admin/service accounts authenticating from multiple countries in a short window, a possible downstream signal of credentials stolen via FMC exploitation. Requires environment-specific tuning of `AppDisplayName` to match your Cisco/RADIUS integration naming.
+
+#### Suspicious Child Process from PaperCut Service (Mass Exploitation Campaign)
+- **Actor / Campaign:** Likely Russian-speaking actor, AI-agent-driven PaperCut campaign
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1059.001/.003 — PowerShell/Windows Command Shell
+- **Data source:** DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where (InitiatingProcessFileName has_any ("pc-app.exe", "pcclient.exe", "PCServer.exe", "javaw.exe")
+        and InitiatingProcessFolderPath has "papercut")
+| where FileName in~ ("cmd.exe", "powershell.exe", "certutil.exe", "mshta.exe", "wscript.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No specific IOCs were published in the source; this targets the known PaperCut NG/MF RCE exploitation pattern (shell spawned from the PaperCut Java service). Confirm PaperCut server inventory and patch level before triage, and expect legitimate print-management scripting on some estates.
+
+#### Chrome-Spawned Suspicious Child Process (Potential BlueMoon Exploit Chain)
+- **Actor / Campaign:** Multiple cyber-espionage groups — "BlueMoon" exploit kit (Windows + Chrome 0-days)
+- **MITRE ATT&CK:** T1189 — Drive-by Compromise; T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents
+- **Source:** [10]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "chrome.exe"
+| where FileName in~ ("cmd.exe", "powershell.exe", "rundll32.exe", "regsvr32.exe", "mshta.exe", "werfault.exe")
+| where InitiatingProcessIntegrityLevel in ("Low", "AppContainer")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessIntegrityLevel, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No file/IOC details were disclosed for BlueMoon; this hunts generically for renderer/sandbox-escape behavior (low-integrity Chrome spawning a shell or LOLBin), which is the expected artifact of chained Chrome + Windows kernel zero-days. Tune out legitimate Chrome crash-handler (WerFault) invocations.
+
+#### MikroTik RouterOS Exploitation Attempts (btest / Argument Injection)
+- **Actor / Campaign:** Unattributed — actively exploited per CISA KEV
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1068 — Exploitation for Privilege Escalation
+- **Data source:** CommonSecurityLog / Syslog (perimeter device logs), DeviceNetworkEvents (if endpoints proxy through RouterOS)
+- **Source:** [11] [13] [14]
+
+```kql
+// Requires RouterOS/syslog ingestion into CommonSecurityLog or a custom table
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor has "MikroTik" or Message has_any ("btest", "RouterOS")
+| where Message has_any ("policy mask", "btest", "unauthenticated")
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, Message
+| take 100
+```
+
+```kql
+// Hunt for endpoints/devices reaching RouterOS management/btest ports (tune port list to your estate)
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemotePort in (2000, 8291, 8728, 8729) // btest / API / API-SSL ports
+| summarize Attempts = count(), Devices = dcount(DeviceName) by RemoteIP, RemotePort
+| where Attempts > 20
+| take 100
+```
+
+*Note:* MikroTik RouterOS devices are not directly instrumented by Defender EDR; ingest RouterOS/syslog into Sentinel (CommonSecurityLog or a custom table) for the first query. The second query is a coarse heuristic for scanning/exploitation attempts against known RouterOS management ports and needs baseline tuning per network to avoid legitimate admin traffic false positives. Prioritize per BOD 26-04 given confirmed active exploitation (KEV).
+
+> [2] Attackers Chain JFrog Artifactory Flaws to Gain Admin Control and Plant Backdoors — https://thehackernews.com/2026/09/attackers-chain-jfrog-artifactory-flaws.html
+> [3] China-Linked UNC3569 Exploited Sogou Input Method Flaw to Deploy GRAYRABBIT Backdoor — https://thehackernews.com/2026/09/china-linked-unc3569-exploited-sogou.html
+> [4] Cisco FMC Flaws Exploited to Steal Credentials and Deploy Qilin Ransomware — https://thehackernews.com/2026/09/cisco-fmc-flaws-exploited-to-steal.html
+> [8] AI-powered attack exploited PaperCut flaws to hack 395 organizations — https://www.bleepingcomputer.com/news/security/ai-powered-attack-exploited-papercut-flaws-to-hack-395-organizations/
+> [9] Cisco FMC flaws exploited by ransomware gang, state-sponsored hackers — https://www.bleepingcomputer.com/news/security/cisco-fmc-flaws-exploited-by-ransomware-gang-state-sponsored-hackers/
+> [10] New 'BlueMoon' kit exploited Windows and Chrome zero-day flaws — https://www.bleepingcomputer.com/news/security/new-bluemoon-kit-exploited-windows-and-chrome-zero-day-flaws/
+> [11] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/10/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [13] CVE-2026-86060 — MikroTik RouterOS Improper Neutralization of Argument Delimiters — https://nvd.nist.gov/vuln/detail/CVE-2026-86060
+> [14] CVE-2026-67277 — MikroTik RouterOS Missing Authentication for Critical Function — https://nvd.nist.gov/vuln/detail/CVE-2026-67277
