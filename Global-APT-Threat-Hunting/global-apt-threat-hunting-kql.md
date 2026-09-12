@@ -5710,3 +5710,203 @@ DeviceNetworkEvents
 > [11] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/10/cisa-adds-two-known-exploited-vulnerabilities-catalog
 > [13] CVE-2026-86060 — MikroTik RouterOS Improper Neutralization of Argument Delimiters — https://nvd.nist.gov/vuln/detail/CVE-2026-86060
 > [14] CVE-2026-67277 — MikroTik RouterOS Missing Authentication for Critical Function — https://nvd.nist.gov/vuln/detail/CVE-2026-67277
+
+### 2026-09-12
+
+*Generated 2026-09-12 13:22 UTC · model `claude-sonnet-5`*
+
+_Lint: 9 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Suspicious Java Child Process on Artifactory Hosts (Possible Rust Backdoor Deployment)
+- **Actor / Campaign:** Unattributed (JFrog Artifactory exploitation chain)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1505.003 — Server Software Component (Web Shell/Backdoor)
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [4], [9], [12], [14], [15]
+
+```kql
+// Artifactory runs as a Java process; attackers chained CVE-2026-42016/42018 to get admin
+// access and drop a Rust backdoor. Hunt for anomalous child processes spawned by java.exe
+// on hosts known to run Artifactory, and for newly-dropped native (ELF/PE) binaries.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName =~ "java.exe" or InitiatingProcessFileName =~ "java"
+| where FileName in~ ("cmd.exe","powershell.exe","bash","sh","wget","curl","nc","ncat","python3")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Requires tagging/asset inventory of Artifactory hosts to reduce noise from legitimate Java build tooling; pivot on any newly written binaries in Artifactory install/data directories via DeviceFileEvents for high-confidence triage.
+
+#### Anomalous Artifactory Admin API Token Usage / New Admin User Creation
+- **Actor / Campaign:** Unattributed (JFrog Artifactory exploitation chain)
+- **MITRE ATT&CK:** T1078.001 — Valid Accounts: Default Accounts; T1548 — Abuse Elevation Control Mechanism
+- **Data source:** DeviceNetworkEvents, CommonSecurityLog (if reverse proxy/WAF logs ingested)
+- **Source:** [4], [9], [12], [14], [15]
+
+```kql
+// CVE-2026-42018 can return an internal anonymous-user token even when anonymous access is
+// disabled; CVE-2026-42016 allows privilege escalation via token signature bypass. Hunt for
+// REST calls to Artifactory admin/security endpoints from unexpected source IPs.
+CommonSecurityLog
+| where TimeGenerated > ago(30d)
+| where RequestURL has_any ("/artifactory/api/security", "/artifactory/api/system", "/access/api/v1/users")
+| where DeviceAction !in ("allow") or RequestMethod in ("POST","PUT","DELETE")
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, RequestMethod, DeviceAction
+| take 100
+```
+
+*Note:* Column names depend on your reverse-proxy/WAF CEF mapping; adjust `RequestURL`/`DeviceAction` fields accordingly. Baseline normal admin activity first — this is heuristic and needs environment tuning.
+
+#### ScreenConnect Unauthorized File Transfer / Execution in Active Session
+- **Actor / Campaign:** Unattributed (CVE-2026-84869 exploitation)
+- **MITRE ATT&CK:** T1219 — Remote Access Software; T1548 — Abuse Elevation Control Mechanism
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [9], [13]
+
+```kql
+// CVE-2026-84869 allows file transfer/execution through an active ScreenConnect session
+// without authorization or host confirmation. Hunt for ScreenConnect processes spawning
+// unexpected child processes or writing files outside expected paths.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("ScreenConnect.ClientService.exe","ScreenConnect.WindowsClient.exe","ConnectWiseControl.Client.exe")
+| where FileName in~ ("cmd.exe","powershell.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* ScreenConnect legitimately spawns remote-control child processes; look for execution immediately following unattended/host-confirmation-bypassed sessions, and correlate with unusual off-hours activity.
+
+#### GitLab Repository Commits API Path Traversal Attempt
+- **Actor / Campaign:** Unattributed (CVE-2026-85706 exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1005 — Data from Local System
+- **Data source:** W3CIISLog / AzureDiagnostics (reverse proxy or app gateway logs in front of GitLab)
+- **Source:** [10], [16]
+
+```kql
+// Unauthenticated path traversal via the repository commits API allows arbitrary file read.
+// Hunt web-tier logs for traversal sequences targeting the commits API.
+W3CIISLog
+| where TimeGenerated > ago(30d)
+| where csUriStem has "/api/v4/projects" and csUriStem has "/repository/commits"
+| where csUriQuery has_any ("..%2f", "../", "%2e%2e%2f", "..\\")
+| project TimeGenerated, cIP, csUriStem, csUriQuery, scStatus
+| take 100
+```
+
+*Note:* Table/column names depend on where your GitLab reverse proxy logs are ingested (IIS, nginx via Syslog, or App Gateway diagnostics) — adapt the field mapping; unauthenticated 200/206 responses to traversal-laden requests are highest priority.
+
+#### Passkey / Passwordless Sign-In Lure Leading to M365 Account Compromise
+- **Actor / Campaign:** ShinyHunters, Helix (Microsoft 365 extortion campaigns)
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link; T1556.006 — Modify Authentication Process: Multi-Factor Authentication
+- **Data source:** EmailEvents, SigninLogs, AADUserRiskEvents
+- **Source:** [3]
+
+```kql
+// Threat actors linked to ShinyHunters/Helix use passkey/SSO-themed social engineering to
+// harvest M365 credentials/session tokens. Hunt for phishing lures with passkey keywords
+// followed by anomalous passkey/authentication-method registration.
+EmailEvents
+| where Timestamp > ago(30d)
+| where Subject has_any ("passkey", "security key", "verify your sign-in", "set up passkey") 
+        or Body has_any ("passkey", "register your security key")
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject, ThreatTypes, UrlCount
+| take 100
+```
+
+```kql
+// Correlate with unusual new authentication method / passkey registrations shortly after
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where AuthenticationRequirement == "singleFactorAuthentication" or ResultType == 0
+| where AppDisplayName has_any ("Office 365", "Microsoft 365")
+| summarize count(), makeset(IPAddress) by UserPrincipalName, bin(TimeGenerated, 1h)
+| where count_ > 5
+| take 100
+```
+
+*Note:* First query is keyword-heuristic and needs tuning to your org's phishing simulation/allow-listed vendors; second query flags burst sign-in activity that should be cross-referenced with new MFA/passkey method additions in AAD audit logs.
+
+#### Endpoint Calling Anthropic/LLM API Endpoints from Server or Automation Context
+- **Actor / Campaign:** GTG-20006 (Russia-linked, aligned with Midnight Blizzard); various GTGs abusing Claude
+- **MITRE ATT&CK:** T1588.007 — Obtain Capabilities: Artificial Intelligence; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceNetworkEvents
+- **Source:** [2], [6], [7]
+
+```kql
+// State-sponsored and criminal groups (incl. GTG-20006) abuse Claude via API to automate
+// malware rebuild/exploitation. Hunt for outbound calls to Anthropic API endpoints from
+// servers, build systems, or non-developer endpoints that shouldn't call LLM APIs directly.
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has "api.anthropic.com" or RemoteUrl has "claude.ai"
+| where DeviceName !in ("known-dev-workstation-allowlist") // tune to your environment
+| summarize ConnectionCount = count(), Ports = makeset(RemotePort) by DeviceName, InitiatingProcessFileName, RemoteUrl
+| where ConnectionCount > 20
+| take 100
+```
+
+*Note:* Requires an allow-list of endpoints authorized to call Anthropic APIs (e.g., approved internal tooling); flag automation/CI/build servers and unmanaged scripts making repeated calls, which may indicate script-driven exfiltration or malware-rebuild loops rather than interactive developer use.
+
+#### ClickFix-Style Clipboard-Paste Execution via AI-Platform-Themed Lures
+- **Actor / Campaign:** Unattributed (campaigns abusing Claude Artifacts / shared AI conversations per Huntress)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste; T1218 — System Binary Proxy Execution
+- **Data source:** DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+// Huntress reports weaponized Claude Artifacts / shared AI conversations used as ClickFix-style
+// lures instructing users to paste and run commands. Hunt for mshta/powershell launched via
+// Run dialog or clipboard-paste patterns immediately following browser activity to AI-platform domains.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe","mshta.exe","cmd.exe")
+| where ProcessCommandLine has_any ("iex", "IEX", "downloadstring", "-enc", "FromBase64String")
+| where InitiatingProcessFileName in~ ("explorer.exe","cmd.exe")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* This is a generic ClickFix pattern (not AI-platform-specific IOC); correlate with recent DeviceNetworkEvents/browser history showing navigation to claude.ai or shared-artifact URLs to raise confidence, since legitimate admin scripting will also match.
+
+#### Automated Package Install Followed by Outbound C2 (Supply-Chain Agent Behavior)
+- **Actor / Campaign:** RubyGems campaign linked to swarm of OpenAI agents (May 2026)
+- **MITRE ATT&CK:** T1195.001 — Supply Chain Compromise: Compromise Software Dependencies and Development Tools; T1059.005 — Command and Scripting Interpreter: Ruby
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// The RubyGems attack (May 2026) achieved RCE on RubyDoc servers via malicious gems, reportedly
+// orchestrated by autonomous AI agents. Hunt for gem install activity immediately followed by
+// unexpected outbound network connections from the same process tree — a generic supply-chain
+// compromise pattern applicable to build/CI servers pulling Ruby gems.
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has "gem install" or ProcessCommandLine has "bundle install"
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where RemoteUrl !has "rubygems.org"
+) on DeviceId
+| where DeviceNetworkEvents.Timestamp between (DeviceProcessEvents.Timestamp .. (DeviceProcessEvents.Timestamp + 10m))
+| project ProcTime=Timestamp, DeviceName, ProcessCommandLine, NetTime=Timestamp1, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* No concrete IOCs (package names/hashes) were disclosed in the source; this is a behavioral pattern for build/CI/RubyDoc-hosting servers and needs tuning to exclude legitimate gem mirrors/CDNs.
+
+> [1] OpenAI Agents Linked to RubyGems Campaign That Gained RCE on RubyDoc Servers — https://thehackernews.com/2026/09/openai-agents-linked-to-rubygems.html
+> [2] Hackers abused Claude to extract secrets from 1.8M Android apps — https://www.bleepingcomputer.com/news/security/hackers-abused-claude-to-extract-secrets-from-18m-android-apps/
+> [3] Passkey-themed phishing attacks lead to Microsoft 365 data theft — https://www.bleepingcomputer.com/news/security/passkey-themed-phishing-attacks-lead-to-microsoft-365-data-theft/
+> [4] Artifactory flaws chained in attacks deploying backdoor malware — https://www.bleepingcomputer.com/news/security/artifactory-flaws-chained-in-attacks-deploying-backdoor-malware/
+> [6] Claude Used to Automate Exploitation and Data Theft Across Multiple Victims — https://thehackernews.com/2026/09/claude-used-to-automate-exploitation.html
+> [7] Russian State-Sponsored Hackers Use Claude to Rebuild Malware After Detection — https://thehackernews.com/2026/09/russian-state-sponsored-hackers-use.html
+> [8] How Threat Actors Are Turning Trusted AI Platforms Into an Attack Surface — https://www.bleepingcomputer.com/news/security/how-threat-actors-are-turning-trusted-ai-platforms-into-an-attack-surface/
+> [9] CISA Adds Three Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/11/cisa-adds-three-known-exploited-vulnerabilities-catalog
+> [10] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/11/cisa-adds-one-known-exploited-vulnerability-catalog
+> [12] Attackers Chain JFrog Artifactory Flaws to Gain Admin Control and Plant Backdoors — https://thehackernews.com/2026/09/attackers-chain-jfrog-artifactory-flaws.html
+> [13] CVE-2026-84869 — ConnectWise ScreenConnect — https://nvd.nist.gov/vuln/detail/CVE-2026-84869
+> [14] CVE-2026-42016 — JFrog Artifactory Incorrect Authorization Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-42016
+> [15] CVE-2026-42018 — JFrog Artifactory Improper Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-42018
+> [16] CVE-2026-85706 — GitLab Community Edition and Enterprise Edition Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-85706
