@@ -5910,3 +5910,113 @@ DeviceProcessEvents
 > [14] CVE-2026-42016 — JFrog Artifactory Incorrect Authorization Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-42016
 > [15] CVE-2026-42018 — JFrog Artifactory Improper Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-42018
 > [16] CVE-2026-85706 — GitLab Community Edition and Enterprise Edition Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-85706
+
+### 2026-09-13
+
+*Generated 2026-09-13 13:22 UTC · model `claude-sonnet-5`*
+
+_Lint: 5 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Mass CEO-Impersonation Financial Fraud Emails via Third-Party Bulk Infrastructure
+- **Actor / Campaign:** Unattributed (Microsoft-disclosed financial fraud scam campaign)
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link / T1585.002 — Establish Accounts: Email Accounts
+- **Data source:** EmailEvents
+- **Source:** [1]
+
+```kql
+// Behavioral: burst of CEO-themed financial fraud lures from external senders in short window
+EmailEvents
+| where Timestamp > ago(30d)
+| where SenderDisplayName has_any ("CEO", "Chief Executive", "President", "Managing Director")
+| where DeliveryAction == "Delivered"
+| where Subject has_any ("payment", "wire", "invoice", "urgent", "transfer", "confidential request")
+| summarize EmailCount = count(), Recipients = dcount(RecipientEmailAddress), Subjects = make_set(Subject, 10)
+    by SenderFromAddress, SenderDisplayName, bin(Timestamp, 1h)
+| where EmailCount > 20  // tune to environment mail volume
+| order by EmailCount desc
+| take 100
+```
+
+*Note:* Heuristic/behavioral only — no IOCs were published; tune volume thresholds and lure keywords to your environment, and cross-reference SenderFromAddress against known legitimate executive addresses to reduce FPs.
+
+#### New Passkey / FIDO2 Security Info Registered on Entra ID Account
+- **Actor / Campaign:** Unattributed (Microsoft-disclosed passkey phishing campaign)
+- **MITRE ATT&CK:** T1098.005 — Account Manipulation: Device Registration / T1556.006 — Modify Authentication Process: Multi-Factor Authentication
+- **Data source:** AuditLogs (Microsoft Entra ID)
+- **Source:** [1]
+
+```kql
+AuditLogs
+| where TimeGenerated > ago(14d)
+| where OperationName in ("Register security info", "User registered security info", "Update user")
+| where Result == "success"
+| extend Detail = tostring(TargetResources[0].displayName)
+| where AdditionalDetails has_any ("FIDO2", "Passkey", "Security Key")
+| project TimeGenerated, InitiatedBy = tostring(InitiatedBy.user.userPrincipalName), Detail, OperationName, ResultReason, IPAddress = tostring(InitiatedBy.user.ipAddress)
+| take 100
+```
+
+*Note:* Flag registrations from unfamiliar IPs/geolocations or shortly after a suspicious sign-in/password reset; correlate with SigninLogs for the same UPN in the preceding 1 hour to reduce noise from legitimate self-service passkey onboarding.
+
+#### New Inbox Forwarding Rule Created Shortly After Suspicious Sign-In (Post-Passkey-Phish Exfiltration)
+- **Actor / Campaign:** Unattributed (Microsoft-disclosed passkey phishing / cloud account hijack campaign)
+- **MITRE ATT&CK:** T1114.003 — Email Collection: Email Forwarding Rule / T1078.004 — Valid Accounts: Cloud Accounts
+- **Data source:** CloudAppEvents / OfficeActivity
+- **Source:** [1]
+
+```kql
+CloudAppEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("New-InboxRule", "Set-InboxRule", "Set-Mailbox")
+| extend Parameters = RawEventData
+| where Parameters has_any ("ForwardTo", "ForwardingSmtpAddress", "RedirectTo")
+| project Timestamp, AccountDisplayName, ActionType, IPAddress, Parameters
+| take 100
+```
+
+*Note:* High-signal but requires baseline of legitimate forwarding-rule usage in your tenant; pair with concurrent atypical sign-in location/device to confirm account takeover context described in [1].
+
+#### Suspicious `gem install` Followed by Unexpected Outbound Connection (Supply-Chain RCE)
+- **Actor / Campaign:** OpenAI-agent-driven RubyGems supply-chain campaign
+- **MITRE ATT&CK:** T1195.001 — Supply Chain Compromise: Compromise Software Dependencies and Development Tools
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+let GemProcs = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("ruby.exe","ruby","gem.exe","gem")
+| where ProcessCommandLine has "install"
+| project Timestamp, DeviceId, InstallPid = ProcessId, ProcessCommandLine, AccountName;
+GemProcs
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName in~ ("ruby.exe","ruby","gem.exe","gem")
+) on DeviceId
+| where Timestamp1 between (Timestamp .. (Timestamp + 5m))
+| project Timestamp, DeviceId, ProcessCommandLine, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* Behavioral/TTP-based — [2] describes no specific package names, hashes, or IPs; this hunts for the general pattern of a `gem install` immediately followed by network egress, which warrants manual review, especially on RubyDoc/documentation-generation servers.
+
+#### Child Process Spawned From Ruby/Gem Process (Potential Malicious Gem Payload Execution)
+- **Actor / Campaign:** OpenAI-agent-driven RubyGems supply-chain campaign
+- **MITRE ATT&CK:** T1059 — Command and Scripting Interpreter / T1195.001 — Supply Chain Compromise
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("ruby.exe","ruby","gem.exe","gem")
+| where FileName in~ ("cmd.exe","powershell.exe","bash","sh","curl","wget","python.exe","python3")
+| project Timestamp, DeviceId, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Documentation/build servers (e.g., RubyDoc-style gem doc generation) legitimately shell out at times; baseline normal build tooling in your environment before alerting, and prioritize hits where the spawned command includes network utilities (curl/wget) or encoded commands.
+
+> [1] Attackers Use Passkey Phishing to Hijack Microsoft Cloud Accounts and Exfiltrate Data — https://thehackernews.com/2026/09/attackers-use-passkey-phishing-to.html
+> [2] OpenAI Agents Linked to RubyGems Campaign That Gained RCE on RubyDoc Servers — https://thehackernews.com/2026/09/openai-agents-linked-to-rubygems.html
