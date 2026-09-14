@@ -6020,3 +6020,138 @@ DeviceProcessEvents
 
 > [1] Attackers Use Passkey Phishing to Hijack Microsoft Cloud Accounts and Exfiltrate Data — https://thehackernews.com/2026/09/attackers-use-passkey-phishing-to.html
 > [2] OpenAI Agents Linked to RubyGems Campaign That Gained RCE on RubyDoc Servers — https://thehackernews.com/2026/09/openai-agents-linked-to-rubygems.html
+
+### 2026-09-14
+
+*Generated 2026-09-14 13:28 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### GrayRabbit backdoor — suspicious child process from Sogou Input Method
+- **Actor / Campaign:** China-aligned espionage group exploiting CVE-2026-51990 (Sogou Input Method)
+- **MITRE ATT&CK:** T1203 — Exploitation for Client Execution; T1574 — Hijack Execution Flow
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+// Heuristic: Sogou Input Method binaries are not typically observed spawning
+// scripting/LOLBIN interpreters. Process names below are inferred from the
+// product family (Sogou Input Method / SogouCloud) — verify actual binary
+// names in your environment before relying on this.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("Sogou", "SGTool", "SogouCloud", "SGIM")
+| where FileName in~ ("cmd.exe","powershell.exe","powershell_ise.exe","rundll32.exe","regsvr32.exe","mshta.exe","wscript.exe","cscript.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No confirmed process/file names were published for GrayRabbit; this is TTP-based and needs tuning against the actual vulnerable binary name once IOCs are released. Expect FPs from legitimate IME auto-update helpers — validate command lines.
+
+#### GrayRabbit — outbound network connections from Sogou Input Method process tree
+- **Actor / Campaign:** China-aligned espionage group exploiting CVE-2026-51990
+- **MITRE ATT&CK:** T1071 — Application Layer Protocol; T1105 — Ingress Tool Transfer
+- **Data source:** DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("Sogou", "SGTool", "SogouCloud", "SGIM")
+| where RemoteIPType == "Public"
+| where RemotePort in (80, 443, 8080, 8443) or RemotePort !in (80,443)  // include non-standard ports as anomalous
+| summarize ConnCount = count(), RemoteIPs = make_set(RemoteIP, 10) by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+| where ConnCount > 5
+| take 100
+```
+
+*Note:* Establish a baseline first — Sogou IME legitimately calls home to cloud dictionary/update services; alert on new/rare destinations or beaconing patterns rather than raw volume.
+
+#### GrayRabbit — persistence via registry Run key from IME process
+- **Actor / Campaign:** China-aligned espionage group exploiting CVE-2026-51990
+- **MITRE ATT&CK:** T1547.001 — Registry Run Keys / Startup Folder
+- **Data source:** DeviceRegistryEvents
+- **Source:** [2]
+
+```kql
+DeviceRegistryEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("Sogou", "SGTool", "SogouCloud", "SGIM")
+| where RegistryKey has_any (@"\CurrentVersion\Run", @"\CurrentVersion\RunOnce", @"\Winlogon")
+| project Timestamp, DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+| take 100
+```
+
+*Note:* Legitimate IME installers can write Run keys during install/update; scope hunting to hosts with no recent legitimate Sogou update/install event.
+
+#### New passkey/FIDO2 credential registered shortly after risky sign-in
+- **Actor / Campaign:** Passkey phishing campaign against Microsoft cloud accounts (Microsoft disclosure)
+- **MITRE ATT&CK:** T1556.006 — Modify Authentication Process: Multi-Factor Authentication; T1098.005 — Account Manipulation: Device Registration
+- **Data source:** SigninLogs, AuditLogs
+- **Source:** [3]
+
+```kql
+let RiskySignins = SigninLogs
+| where Timestamp > ago(14d)
+| where RiskLevelDuringSignIn in ("medium","high") or RiskState == "atRisk"
+| project UserPrincipalName, SigninTime = Timestamp, IPAddress, Location = tostring(LocationDetails.city);
+AuditLogs
+| where TimeGenerated > ago(14d)
+| where ActivityDisplayName has "Register security info"
+| extend Actor = tostring(InitiatedBy.user.userPrincipalName)
+| join kind=inner RiskySignins on $left.Actor == $right.UserPrincipalName
+| where TimeGenerated - SigninTime between (0min .. 60min)
+| project TimeGenerated, Actor, IPAddress, Location, ActivityDisplayName, AdditionalDetails
+| take 100
+```
+
+*Note:* This flags accounts that register new sign-in credentials (potentially a passkey) within an hour of a risky sign-in — a strong ATO indicator, but tune the risk-level filter and window to your Entra ID Protection sensitivity to reduce noise from legit self-service registration after travel/VPN changes.
+
+#### Mass CEO-impersonation financial fraud email via third-party delivery infrastructure
+- **Actor / Campaign:** Financial fraud scam campaign abusing third-party email infra (Microsoft disclosure)
+- **MITRE ATT&CK:** T1566.001 — Phishing: Spearphishing Attachment/Link; T1656 — Impersonation
+- **Data source:** EmailEvents, EmailAuthenticationDetails
+- **Source:** [3]
+
+```kql
+EmailEvents
+| where Timestamp > ago(14d)
+| where SenderDisplayName has_any ("CEO","Chief Executive Officer","President","Managing Director")
+| join kind=inner (
+    EmailAuthenticationDetails
+    | where Timestamp > ago(14d)
+    | where SPFResult != "pass" or DKIMResult != "pass" or DmarcResult != "pass"
+) on NetworkMessageId
+| where SenderFromAddress !endswith "@yourcompany.com"  // replace with your accepted domains
+| summarize RecipientCount = dcount(RecipientEmailAddress), Subjects = make_set(Subject, 5) by SenderFromAddress, SenderDisplayName, bin(Timestamp, 1h)
+| where RecipientCount > 20
+| take 100
+```
+
+*Note:* Update the accepted-domain filter for your tenant; the "over 1M emails in 3 days" pattern from the reporting suggests hunting for burst volume from a single spoofed sender identity rather than isolated messages.
+
+#### Bulk export/download of customer PII following possible pretexting contact (behavioral, generic)
+- **Actor / Campaign:** Revolut data breach — threat actor impersonating a government agency to obtain customer data [1]
+- **MITRE ATT&CK:** T1567 — Exfiltration Over Web Service; T1530 — Data from Cloud Storage
+- **Data source:** CloudAppEvents (or OfficeActivity/SharePoint audit logs, environment-dependent)
+- **Source:** [1]
+
+```kql
+// Generic anomaly hunt: single identity performing a large-volume export/download
+// of files/records in a short window, which is the pattern consistent with an
+// insider being socially engineered into handing over bulk customer data.
+// No technical IOCs were published for the Revolut incident — tune thresholds locally.
+CloudAppEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileDownloaded", "FileDownloadedExternal", "FileAccessed", "FileExported")
+| summarize EventCount = count(), DistinctFiles = dcount(ObjectId) by AccountDisplayName, bin(Timestamp, 1h)
+| where DistinctFiles > 200 or EventCount > 500
+| order by DistinctFiles desc
+| take 100
+```
+
+*Note:* Highly heuristic and requires baselining per role (e.g., support/compliance staff routinely access larger volumes); pair with DLP alerts on PII/passport-document classifiers if available, since [1] provides no technical IOCs to hunt on directly.
+
+> [1] Revolut discloses data breach exposing financial info, passports — https://www.bleepingcomputer.com/news/security/revolut-discloses-data-breach-exposing-financial-info-passports/
+> [2] Hackers exploit Tencent app flaw to deploy GrayRabbit malware — https://www.bleepingcomputer.com/news/security/hackers-exploit-tencent-app-flaw-to-deploy-grayrabbit-malware/
+> [3] Attackers Use Passkey Phishing to Hijack Microsoft Cloud Accounts and Exfiltrate Data — https://thehackernews.com/2026/09/attackers-use-passkey-phishing-to.html
