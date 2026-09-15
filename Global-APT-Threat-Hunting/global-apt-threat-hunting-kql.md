@@ -6155,3 +6155,153 @@ CloudAppEvents
 > [1] Revolut discloses data breach exposing financial info, passports — https://www.bleepingcomputer.com/news/security/revolut-discloses-data-breach-exposing-financial-info-passports/
 > [2] Hackers exploit Tencent app flaw to deploy GrayRabbit malware — https://www.bleepingcomputer.com/news/security/hackers-exploit-tencent-app-flaw-to-deploy-grayrabbit-malware/
 > [3] Attackers Use Passkey Phishing to Hijack Microsoft Cloud Accounts and Exfiltrate Data — https://thehackernews.com/2026/09/attackers-use-passkey-phishing-to.html
+
+### 2026-09-15
+
+*Generated 2026-09-15 13:28 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — query 2: unbalanced '()'. All queries are CANDIDATES; validate before use._
+
+#### Rapid Post-Exploitation Pivot from Notebook/RCE to SSH Client
+- **Actor / Campaign:** Unattributed human operator (Sysdig research)
+- **MITRE ATT&CK:** T1210 — Exploitation of Remote Services / T1021.004 — Remote Services: SSH
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// Looks for an ssh/scp/sftp client launch within 5 minutes of a marimo-related process on the same device
+let marimoProcs = DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where ProcessCommandLine has "marimo" or FileName has "marimo"
+| project DeviceId, MarimoTime = Timestamp;
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where FileName in~ ("ssh", "scp", "sftp")
+| join kind=inner marimoProcs on DeviceId
+| where Timestamp - MarimoTime between (0min .. 5min)
+| project DeviceId, MarimoTime, SSHTime = Timestamp, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Heuristic and environment-specific — tune the "marimo" string match to your notebook naming, and extend the time window if your telemetry ingestion has lag. Best deployed on Linux-onboarded cloud workstations/servers running notebook services.
+
+#### Cisco Secure Email Gateway SQL Injection / Root Command Execution Attempt (CVE-2026-76461)
+- **Actor / Campaign:** Unattributed (KEV-listed active exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (Cisco ESA/AsyncOS syslog forwarded to Sentinel)
+- **Source:** [2] [9] [11]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(7d)
+| where DeviceVendor has "Cisco" and (DeviceProduct has "Email" or DeviceProduct has "AsyncOS")
+| where RequestUrl has_any ("UNION SELECT", "' OR '1'='1", "SLEEP(", "--", "xp_cmdshell", ";--")
+       or Message has_any ("UNION SELECT", "' OR '1'='1", "xp_cmdshell")
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, RequestUrl, Message
+| take 100
+```
+
+*Note:* Requires Cisco ESA syslog ingestion; adjust field/table mapping to your actual CEF/syslog schema. Treat any hit as high priority given root-level RCE impact — validate patch status per CISA BOD 26-04.
+
+#### Chrome Renderer Spawning Script Engines (Possible GRIMWEDGE Exploit Chain)
+- **Actor / Campaign:** UTA0560 (China-linked, GRIMWEDGE backdoor)
+- **MITRE ATT&CK:** T1189 — Drive-by Compromise / T1204.001 — User Execution: Malicious Link / T1059.007 — JavaScript
+- **Data source:** DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(3d)
+| where InitiatingProcessFileName =~ "chrome.exe"
+| where FileName in~ ("wscript.exe", "cscript.exe", "mshta.exe", "powershell.exe", "rundll32.exe", "cmd.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Chrome legitimately spawns very few child processes; any script-engine or shell child from chrome.exe warrants investigation, especially on devices belonging to NGO/advocacy-org users. No published GRIMWEDGE file hashes/domains yet — refine once Volexity IOCs are released.
+
+#### ClickFix-Style Paste-and-Run Execution from Explorer/Browser Context
+- **Actor / Campaign:** HBO Max Reddit account compromise (ClickFix malvertising)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste / T1059.001 — PowerShell
+- **Data source:** DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(3d)
+| where InitiatingProcessFileName in~ ("explorer.exe", "chrome.exe", "msedge.exe", "firefox.exe")
+| where FileName in~ ("powershell.exe", "cmd.exe", "mshta.exe", "wscript.exe")
+| where ProcessCommandLine has_any ("IEX", "Invoke-Expression", "DownloadString", "-enc", "mshta http", "curl.exe -o", "certutil -urlcache")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Classic ClickFix (fake CAPTCHA/verify-you're-human) pattern: user pastes a run-dialog/PowerShell command from an ad. High-signal but can false-positive on legitimate IT scripting delivered via browser downloads — validate command-line content and source URL/referrer where available.
+
+#### MeshCentral Agent Installation / Unexpected MeshAgent Activity
+- **Actor / Campaign:** 3BB network intrusion (Thailand ISP)
+- **MITRE ATT&CK:** T1219 — Remote Access Software / T1543 — Create or Modify System Process
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [5]
+
+```kql
+union
+(
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FileName has_any ("meshagent", "MeshAgent.exe", "MeshAgent.msh")
+    | project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessFileName, ActionType
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName has "meshagent" or ProcessCommandLine has "meshcentral"
+    | project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, ActionType = "ProcessCreated"
+)
+| take 100
+```
+
+*Note:* MeshCentral is a legitimate RMM tool, so this will fire on authorized deployments — cross-reference against your approved RMM asset inventory and flag only instances on servers/devices without an expected MeshCentral deployment record.
+
+#### Gitea Web Process Spawning Shell/Download Utilities (Possible Red Heron RCE)
+- **Actor / Campaign:** Red Heron (suspected Chinese actor, Gitea RCE campaign)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1059.004 — Unix Shell
+- **Data source:** DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName has "gitea"
+| where FileName in~ ("bash", "sh", "curl", "wget", "python3", "perl", "nc")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* A Gitea service process spawning a shell or download utility is highly anomalous and should be treated as likely successful RCE. Prioritize internet-facing Gitea hosts, especially Taiwan-based or other externally exposed instances per the reporting.
+
+#### Mass Scanning Behavior Against Internet-Facing Gitea Instances
+- **Actor / Campaign:** Red Heron
+- **MITRE ATT&CK:** T1595.002 — Active Scanning: Vulnerability Scanning
+- **Data source:** DeviceNetworkEvents (or perimeter firewall logs via CommonSecurityLog)
+- **Source:** [6]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 3000 // default Gitea port
+| summarize DestinationsHit = dcount(RemoteIP), Attempts = count() by InitiatingProcessAccountName, DeviceName, bin(Timestamp, 1h)
+| where DestinationsHit > 20
+| take 100
+```
+
+*Note:* Intended for organizations that expose or proxy Gitea and want to spot inbound scan sweeps; if run from an internal vantage point it instead detects a compromised host scanning outward. Threshold (20 distinct destinations/hour) is a starting point and needs environment tuning.
+
+> [1] Human Attacker Exploits Marimo RCE, Reaches SSH Bastion in Eight Seconds — https://thehackernews.com/2026/09/human-attacker-exploits-marimo-rce.html
+> [2] Cisco patches Secure Email Gateway zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/new-cisco-secure-email-zero-day-exploited-to-execute-commands-as-root/
+> [3] China-Linked Hackers Exploit Chrome-Windows Zero-Day Chain to Deploy GRIMWEDGE — https://thehackernews.com/2026/09/china-linked-hackers-exploit-chrome.html
+> [4] Hackers hijack HBO Max Reddit account to push malware in ClickFix ads — https://www.bleepingcomputer.com/news/security/hackers-hijack-hbo-max-reddit-account-to-push-malware-in-clickfix-ads/
+> [5] 3BB Attacker Used MeshCentral Backdoor for Root Access, Targeted Subscriber Credentials — https://thehackernews.com/2026/09/3bb-attacker-used-meshcentral-backdoor.html
+> [6] Red Heron Exploits Gitea RCE to Compromise 13 Organizations Across Six Countries — https://thehackernews.com/2026/09/red-heron-exploits-gitea-rce-to.html
+> [9] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/14/cisa-adds-one-known-exploited-vulnerability-catalog
+> [11] CVE-2026-76461 — Cisco Secure Email Gateway SQL Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-76461
