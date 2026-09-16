@@ -6305,3 +6305,212 @@ DeviceNetworkEvents
 > [6] Red Heron Exploits Gitea RCE to Compromise 13 Organizations Across Six Countries — https://thehackernews.com/2026/09/red-heron-exploits-gitea-rce-to.html
 > [9] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/14/cisa-adds-one-known-exploited-vulnerability-catalog
 > [11] CVE-2026-76461 — Cisco Secure Email Gateway SQL Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-76461
+
+### 2026-09-16
+
+*Generated 2026-09-16 13:27 UTC · model `claude-sonnet-5`*
+
+_Lint: 11 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### OAuth Device-Code / Consent Phishing Consistent with N0va Phishkit
+- **Actor / Campaign:** N0va Phishkit (unattributed operators)
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link / T1528 — Steal Application Access Token
+- **Data source:** SigninLogs, AADServicePrincipalSignInLogs, AADNonInteractiveUserSignInLogs
+- **Source:** [1]
+
+```kql
+// Behavioral hunt: identity-based phishing kits (like N0va) abuse legitimate OAuth/device-code flows.
+// Look for device-code or non-interactive sign-ins immediately followed by risky app consent from a new location.
+SigninLogs
+| where TimeGenerated > ago(2d)
+| where AuthenticationProtocol in ("deviceCode", "ropc") or ResultType == 0
+| where AppDisplayName has_any ("Microsoft Authentication Broker", "Office 365", "OAuth")
+| join kind=inner (
+    SigninLogs
+    | where TimeGenerated > ago(2d)
+    | summarize FirstSeenLoc = min(TimeGenerated) by UserPrincipalName, Location
+) on UserPrincipalName
+| where TimeGenerated - FirstSeenLoc < 15m
+| project TimeGenerated, UserPrincipalName, AppDisplayName, IPAddress, Location, AuthenticationProtocol, ResultType
+| take 100
+```
+
+*Note:* No concrete N0va IOCs were published; this is a heuristic for device-code/consent phishing patterns. Tune to your tenant's normal device-code usage (e.g., CLI tools) to reduce noise.
+
+#### Suspicious Process Execution from Acronis cPanel Backup Plugin Path (CVE-2026-87886)
+- **Actor / Campaign:** unattributed (Acronis Backup plugin exploitation)
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [2]
+
+```kql
+// Acronis Backup plugin for cPanel/WHM: CVE-2026-87886 is a local privesc via insecure file permissions.
+// Hunt for unexpected process execution or writable-file abuse under Acronis plugin directories.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FolderPath has_any ("acronis", "cpanel", "whm") and FolderPath has "backup"
+| where InitiatingProcessAccountName != "root" and ProcessCommandLine has_any ("chmod", "chown", "cp ", "sh -c", "bash -c")
+| project Timestamp, DeviceName, InitiatingProcessAccountName, FileName, FolderPath, ProcessCommandLine
+| take 100
+```
+
+*Note:* Linux/cPanel hosts may not be onboarded to Defender for Endpoint by default; if using Syslog/AMA, adapt to Syslog table filtering on cron/whm processes. Validate against known patch level of Acronis Backup plugin.
+
+#### GitHub-Hosted Tooling Download Consistent with NightEagle/GhostContainer
+- **Actor / Campaign:** NightEagle APT (GhostContainer backdoor)
+- **MITRE ATT&CK:** T1105 — Ingress Tool Transfer / T1102.001 — Web Service: Dead Drop Resolver
+- **Data source:** DeviceNetworkEvents, DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+// NightEagle stages tools via GitHub raw content and exploits AD/RDP. Hunt for LOLBins pulling from github.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("powershell.exe","certutil.exe","curl.exe","bitsadmin.exe","wget.exe")
+| where ProcessCommandLine has_any ("raw.githubusercontent.com", "github.com")
+| project Timestamp, DeviceName, InitiatingProcessAccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+```kql
+// Companion: repeated RDP auth attempts against domain controllers/servers (possible NightEagle AD/RDP exploitation)
+DeviceLogonEvents
+| where Timestamp > ago(7d)
+| where LogonType == "RemoteInteractive"
+| summarize Attempts = count(), Failed = countif(ActionType == "LogonFailed") by DeviceName, RemoteIP, bin(Timestamp, 1h)
+| where Attempts > 20 and Failed > 15
+| take 100
+```
+
+*Note:* No specific GhostContainer file hashes/domains were disclosed; these are TTP-based hunts. Expect false positives from legit dev/IT use of GitHub CLI tools — scope to servers/DCs.
+
+#### PHP Web Shell Dropped via WooCommerce Wholesale Lead Capture Exploit
+- **Actor / Campaign:** unattributed (mass exploitation campaign)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [5] [8]
+
+```kql
+// Unauthenticated arbitrary file upload in WooCommerce Wholesale Lead Capture leads to PHP webshells.
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath has "wp-content" and (FolderPath has "uploads" or FolderPath has "wholesale")
+| where FileName endswith ".php"
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+```kql
+// Follow-on: web server process spawning shell/system commands after upload (webshell execution)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("php-cgi.exe","php.exe","w3wp.exe","httpd","apache2","php-fpm")
+| where FileName in~ ("cmd.exe","powershell.exe","sh","bash","whoami","id")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Tune folder path filter to your actual WordPress upload directory structure; legitimate plugin file writes during updates can trigger this, so correlate with unexpected timing/unauthenticated web requests in access logs.
+
+#### Unexpected New Admin User Creation / Plugin File Modification (Admin Menu Editor Pro Supply-Chain Backdoor)
+- **Actor / Campaign:** unattributed (Admin Menu Editor Pro maintainer compromise)
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Software Supply Chain / T1136.001 — Create Account: Local Account
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+// Compromised WordPress plugin update created hidden admin accounts. Hunt for plugin file writes followed
+// by unusual PHP execution that creates users (heuristic; adjust paths to your WP install).
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has "admin-menu-editor-pro"
+| where ActionType in ("FileModified","FileCreated")
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* Defender file telemetry on shared web hosting may be limited; if you manage WordPress via a monitored server, this surfaces suspicious plugin file changes. Cross-check with WordPress user_audit logs for accounts created around the same timestamp.
+
+#### Malicious Browser Extension Load Consistent with KREMLIN Banking Malware
+- **Actor / Campaign:** REF9334 (KREMLIN toolkit, Brazilian banking malware)
+- **MITRE ATT&CK:** T1176 — Browser Extensions / T1539 — Steal Web Session Cookie
+- **Data source:** DeviceRegistryEvents, DeviceProcessEvents, DeviceFileEvents
+- **Source:** [7]
+
+```kql
+// KREMLIN installs a malicious Chrome/Edge extension to steal credentials/session tokens after bank-lure infection.
+DeviceRegistryEvents
+| where Timestamp > ago(7d)
+| where RegistryKey has_any (
+    @"SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist",
+    @"SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist")
+| project Timestamp, DeviceName, RegistryKey, RegistryValueData, InitiatingProcessFileName
+| take 100
+```
+
+```kql
+// Chrome/Edge launched with unpacked extension load switches (common for side-loaded malicious extensions)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("chrome.exe","msedge.exe")
+| where ProcessCommandLine has_any ("--load-extension", "--disable-extensions-except")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No specific extension IDs/hashes were published for KREMLIN; these are TTP-based hunts for browser-extension persistence/session-token theft techniques used by this malware family.
+
+#### Rapid Post-Exploitation Pivot from Vulnerable App to SSH Bastion (Marimo-style)
+- **Actor / Campaign:** unattributed human operator (Sysdig research)
+- **MITRE ATT&CK:** T1210 — Exploitation of Remote Services / T1021.004 — Remote Services: SSH
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [15]
+
+```kql
+// Sysdig observed exploitation of Marimo notebook RCE followed by an SSH pivot to a bastion host within 8 seconds.
+// Hunt for a web/notebook process spawning a shell that quickly initiates outbound SSH.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName has_any ("python","python3","marimo","jupyter")
+| where FileName in~ ("ssh","bash","sh","curl","nc")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| join kind=inner (
+    DeviceNetworkEvents
+    | where RemotePort == 22
+    | project Timestamp, DeviceName, RemoteIP, RemotePort
+) on DeviceName
+| where abs(datetime_diff('second', Timestamp, Timestamp1)) <= 30
+| project Timestamp, DeviceName, ProcessCommandLine, RemoteIP, RemotePort
+| take 100
+```
+
+*Note:* Requires Linux/container onboarding to Defender for Endpoint or equivalent EDR; the 8-second pivot window is illustrative, widen as needed. High risk of FPs in dev/notebook environments that legitimately SSH out — tune to internet-facing notebook hosts.
+
+#### Cisco Secure Email Gateway Zero-Day Exploitation Indicators
+- **Actor / Campaign:** unattributed (Cisco SEG zero-day, active exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1059 — Command and Scripting Interpreter
+- **Data source:** CommonSecurityLog (Cisco ESA/SEG syslog), DeviceNetworkEvents
+- **Source:** [16]
+
+```kql
+// Cisco Secure Email Gateway zero-day allows root command execution. Hunt for anomalous admin/API commands
+// or unexpected process/service restarts logged via syslog forwarding from the appliance.
+CommonSecurityLog
+| where TimeGenerated > ago(7d)
+| where DeviceVendor =~ "Cisco" and DeviceProduct has_any ("Secure Email", "ESA", "IronPort")
+| where Activity has_any ("root", "shell", "exec", "config") 
+| project TimeGenerated, DeviceVendor, DeviceProduct, Activity, SourceIP, DestinationIP, Message
+| take 100
+```
+
+*Note:* No IOCs were published for this Cisco SEG zero-day; this query depends on syslog forwarding from the appliance into Sentinel (CommonSecurityLog/Syslog). Prioritize patching per Cisco advisory over detection alone, since exploitation grants root/command execution.
+
+> [1] N0va Phishkit Targets US and EU Businesses: A New Challenge for Identity Security — https://thehackernews.com/2026/09/n0va-phishkit-targets-us-and-eu.html
+> [2] Acronis cPanel Backup Plugin Vulnerability Exploited in Targeted Attacks — https://thehackernews.com/2026/09/acronis-cpanel-backup-plugin.html
+> [3] NightEagle targets Russian companies — https://securelist.com/tr/nighteagle-apt-ghostcontainer-and-tunneling/121323/
+> [5] Attackers Exploit WooCommerce Wholesale Lead Capture Flaw to Plant PHP Web Shells — https://thehackernews.com/2026/09/attackers-exploit-woocommerce-wholesale.html
+> [6] Malcious Admin Menu Editor Pro plugin backdoors 1,500 WordPress sites — https://www.bleepingcomputer.com/news/security/malcious-admin-menu-editor-pro-plugin-backdoors-1-500-wordpress-sites/
+> [7] KREMLIN Banking Malware Hijacks Chrome and Edge to Steal Credentials and Session Tokens — https://thehackernews.com/2026/09/kremlin-banking-malware-hijacks-chrome.html
+> [8] Hackers target WordPress sites via third-party WooCommerce plugin — https://www.bleepingcomputer.com/news/security/hackers-target-wordpress-sites-via-third-party-woocommerce-plugin/
+> [15] Human Attacker Exploits Marimo RCE, Reaches SSH Bastion in Eight Seconds — https://thehackernews.com/2026/09/human-attacker-exploits-marimo-rce.html
+> [16] Cisco patches Secure Email Gateway zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/new-cisco-secure-email-zero-day-exploited-to-execute-commands-as-root/
