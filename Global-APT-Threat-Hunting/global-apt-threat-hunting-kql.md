@@ -6514,3 +6514,148 @@ CommonSecurityLog
 > [8] Hackers target WordPress sites via third-party WooCommerce plugin — https://www.bleepingcomputer.com/news/security/hackers-target-wordpress-sites-via-third-party-woocommerce-plugin/
 > [15] Human Attacker Exploits Marimo RCE, Reaches SSH Bastion in Eight Seconds — https://thehackernews.com/2026/09/human-attacker-exploits-marimo-rce.html
 > [16] Cisco patches Secure Email Gateway zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/new-cisco-secure-email-zero-day-exploited-to-execute-commands-as-root/
+
+### 2026-09-17
+
+*Generated 2026-09-17 13:27 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### FamousSparrow SparroWocky Backdoor — Persistence Behaviors
+- **Actor / Campaign:** FamousSparrow (China-linked)
+- **MITRE ATT&CK:** T1053.005 — Scheduled Task; T1574.002 — DLL Side-Loading
+- **Data source:** DeviceProcessEvents, DeviceImageLoadEvents
+- **Source:** [1]
+
+```kql
+// No concrete IOCs published for SparroWocky yet — behavioral hunt for
+// scheduled-task / registry-run persistence typical of FamousSparrow tradecraft
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("schtasks.exe","reg.exe","rundll32.exe","regsvr32.exe")
+| where ProcessCommandLine has_any ("/create", "RunOnce", "InprocServer32", "COM")
+| where InitiatingProcessFolderPath !has @"\Windows\System32\" or ProcessCommandLine has "http"
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Purely behavioral — no published hashes/domains for SparroWocky at time of writing. Expect noise from legitimate admin scripting; tune by excluding known software deployment tools and correlating with government/LatAm-sector asset tags.
+
+#### Cisco ISE Zero-Day Exploitation Attempts (CVE-2026-76460)
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (Cisco ISE syslog/CEF)
+- **Source:** [2] [5] [11]
+
+```kql
+// Hunt for privileged-API/administrative access bypassing normal web auth on Cisco ISE
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor == "Cisco" and DeviceProduct has "ISE"
+| where Message has_any ("privileged API", "bypass", "unauthenticated", "ers/config")
+| project TimeGenerated, DeviceName, SourceIP, DestinationIP, Message, Activity
+| take 100
+```
+
+*Note:* Field/message content depends on how ISE forwards syslog into Sentinel — validate against actual CEF mapping in your environment. Prioritize patching CVE-2026-76460 immediately; this query is a compensating detection only.
+
+#### GhostContainer Backdoor — GitHub-Hosted C2 Fetch
+- **Actor / Campaign:** NightEagle (APT-Q-95)
+- **MITRE ATT&CK:** T1102.001 — Web Service: Dead Drop Resolver
+- **Data source:** DeviceNetworkEvents
+- **Source:** [3] [9]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any ("raw.githubusercontent.com", "github.com")
+| where InitiatingProcessFileName has_any ("powershell.exe","cmd.exe","rundll32.exe","wscript.exe","mshta.exe","svchost.exe","w3wp.exe")
+| where InitiatingProcessFileName !in~ ("git.exe","GitHubDesktop.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl, RemoteIP, AccountName
+| take 100
+```
+
+*Note:* GhostContainer reportedly leverages GitHub for tool/config hosting — flags non-browser, non-Git processes reaching GitHub raw content. Expect FPs from legitimate DevOps automation; scope to servers/IIS hosts (w3wp.exe) where NightEagle activity was observed.
+
+#### NightEagle Active Directory Replication Abuse (DCSync)
+- **Actor / Campaign:** NightEagle (APT-Q-95)
+- **MITRE ATT&CK:** T1003.006 — OS Credential Dumping: DCSync
+- **Data source:** SecurityEvent (Domain Controllers)
+- **Source:** [3] [9]
+
+```kql
+SecurityEvent
+| where TimeGenerated > ago(14d)
+| where EventID == 4662
+| where ObjectName has "DC=" 
+| where Properties has "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" // DS-Replication-Get-Changes-All
+| project TimeGenerated, Computer, SubjectAccount, SubjectUserSid, ObjectName
+| take 100
+```
+
+*Note:* Baseline against known replication accounts (real DCs, Azure AD Connect, backup service accounts) before alerting — DCSync-style GUIDs also appear in legitimate replication traffic.
+
+#### Potential Wiper / Mass Data Destruction (Toy Ghouls / Hacking Cat)
+- **Actor / Campaign:** Toy Ghouls / Hacking Cat
+- **MITRE ATT&CK:** T1485 — Data Destruction
+- **Data source:** DeviceFileEvents
+- **Source:** [3]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(1h)
+| where ActionType == "FileDeleted"
+| summarize DeletedCount = count(), Files = make_set(FileName, 10) by DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, bin(Timestamp, 5m)
+| where DeletedCount > 300
+| order by DeletedCount desc
+| take 100
+```
+
+*Note:* No specific wiper sample details published — this is a generic burst-deletion heuristic. Tune thresholds to your environment (backup/AV jobs can trigger FPs); combine with process-tree review for unsigned/new binaries.
+
+#### N0va Phishkit — Suspicious OAuth Device-Code / Legacy Auth Sign-Ins
+- **Actor / Campaign:** N0va Phishkit
+- **MITRE ATT&CK:** T1528 — Steal Application Access Token; T1550.001 — Use Alternate Authentication Material
+- **Data source:** SigninLogs
+- **Source:** [7]
+
+```kql
+SigninLogs
+| where TimeGenerated > ago(14d)
+| where ResultType == 0
+| where AuthenticationRequirement == "singleFactorAuthentication"
+| where AppDisplayName has_any ("Microsoft Authentication Broker","Device Login","Microsoft Office")
+| where ClientAppUsed in ("Mobile Apps and Desktop clients","Other clients")
+| summarize SignInCount = count(), IPs = make_set(IPAddress, 5), Apps = make_set(AppDisplayName, 5) by UserPrincipalName
+| where SignInCount > 5
+| take 100
+```
+
+*Note:* N0va abuses legitimate auth flows (device code / OAuth) rather than malware, making detection identity-centric. This is a heuristic for device-code-phishing patterns; pair with Conditional Access sign-in risk and impossible-travel signals to reduce FPs.
+
+#### Acronis cPanel/WHM Backup Plugin — Local Privilege Escalation (CVE-2026-87886)
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [8] [12]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("chmod","chown","cp","sh")
+| where ProcessCommandLine has_any ("acronis", "cpanel", "whm", "/opt/acronis")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* Targets Linux hosts running the Acronis Backup plugin for cPanel/WHM; flags permission-modification commands touching Acronis paths, indicative of exploitation of the insecure default permissions. Patch to a fixed version per vendor advisory; this query is a stop-gap for unpatched exposed systems.
+
+> [1] Chinese hackers use SparroWocky malware in govt espionage attacks — https://www.bleepingcomputer.com/news/security/chinese-hackers-use-sparrowocky-malware-in-govt-espionage-attacks/
+> [2] Cisco warns of max severity ISE zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/cisco-warns-of-identity-service-engine-zero-day-exploited-in-attacks/
+> [3] Three Threat Groups Target Russian Enterprises With Backdoors, Ransomware, and Wipers — https://thehackernews.com/2026/09/three-threat-groups-target-russian.html
+> [5] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/16/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [7] N0va Phishkit Targets US and EU Businesses: A New Challenge for Identity Security — https://thehackernews.com/2026/09/n0va-phishkit-targets-us-and-eu.html
+> [8] Acronis cPanel Backup Plugin Vulnerability Exploited in Targeted Attacks — https://thehackernews.com/2026/09/acronis-cpanel-backup-plugin.html
+> [9] NightEagle targets Russian companies — https://securelist.com/tr/nighteagle-apt-ghostcontainer-and-tunneling/121323/
+> [11] CVE-2026-76460 — Cisco Identity Services Engine: Cisco Identity Services Engine Incorrect Use of Privileged APIs Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-76460
+> [12] CVE-2026-87886 — Acronis Backup: Acronis Backup Incorrect Default Permissions Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-87886
