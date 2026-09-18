@@ -6659,3 +6659,121 @@ DeviceProcessEvents
 > [9] NightEagle targets Russian companies — https://securelist.com/tr/nighteagle-apt-ghostcontainer-and-tunneling/121323/
 > [11] CVE-2026-76460 — Cisco Identity Services Engine: Cisco Identity Services Engine Incorrect Use of Privileged APIs Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-76460
 > [12] CVE-2026-87886 — Acronis Backup: Acronis Backup Incorrect Default Permissions Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-87886
+
+### 2026-09-18
+
+*Generated 2026-09-18 13:26 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### npm postinstall script spawning shell/network activity (WeaselBiscuit / PhantomRaven supply-chain stealers)
+- **Actor / Campaign:** DPRK-linked Contagious Interview cluster (WeaselBiscuit) / unattributed financially motivated actor (PhantomRaven)
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Compromise Software Dependencies and Development Tools
+- **Data source:** DeviceProcessEvents
+- **Source:** [1][3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("npm.exe","npm","node.exe","npm-cli.js")
+| where InitiatingProcessCommandLine has_any ("postinstall","preinstall","install")
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe","bash","sh","curl.exe","wget.exe","node.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Both WeaselBiscuit and PhantomRaven are delivered as npm packages that run malicious logic from install lifecycle scripts [1][3]; this is a broad heuristic that will also catch legitimate build tooling (e.g., node-gyp), so tune with an allowlist of known-good packages/parent paths.
+
+#### Node.js process reading Chrome/Edge extension storage (possible WeaselBiscuit harvesting)
+- **Actor / Campaign:** WeaselBiscuit (overlaps with BeaverTail/Contagious Interview)
+- **MITRE ATT&CK:** T1555.003 — Credentials from Password Stores: Credentials from Web Browsers
+- **Data source:** DeviceFileEvents
+- **Source:** [1]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "node.exe"
+| where FolderPath has_any (@"\Google\Chrome\User Data\", @"\Microsoft\Edge\User Data\")
+| where FolderPath has_any ("Local Extension Settings", "Local Storage")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, FolderPath
+| take 100
+```
+
+*Note:* WeaselBiscuit specifically targets Chrome extension local storage to harvest secrets [1]; a bare node.exe process touching browser profile directories is unusual for normal development activity and warrants review, but some legitimate Electron/dev tools may trigger this.
+
+#### ADB debug-bridge connections consistent with RatHat post-uninstall persistence
+- **Actor / Campaign:** RatHat (assessed China-based operators)
+- **MITRE ATT&CK:** T1071 — Application Layer Protocol / T1098 — Account Manipulation (persistence via ADB)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [4]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort in (5555, 5037)
+| where InitiatingProcessFileName has "adb"
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteIP, RemotePort, RemoteUrl
+| take 100
+```
+
+*Note:* RatHat abuses ADB to retain shell access to Android devices even after app uninstall [4]. Native Defender/Sentinel tables have limited direct visibility into on-device Android malware behavior; this query only covers scenarios where an ADB client process runs on a monitored Windows/Linux host (e.g., attacker jump box) — pair with mobile threat defense telemetry for full coverage.
+
+#### Non-browser process communicating with Telegram Bot API (HEAVYGRAM C2)
+- **Actor / Campaign:** Handala Hack (Iran-linked)
+- **MITRE ATT&CK:** T1102.002 — Web Service: Bidirectional Communication (Telegram C2)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [6]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemoteUrl has_any ("api.telegram.org", "t.me")
+| where InitiatingProcessFileName !in~ ("Telegram.exe","chrome.exe","msedge.exe","firefox.exe","brave.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* HEAVYGRAM uses the Telegram Bot API for C2, exfiltration of credentials/screenshots/session files [6]; requires tuning to exclude legitimate Telegram desktop clients, bots, or automation tools already approved in the environment.
+
+#### LOLBin loading DLL from temp/user-writable path (SparroWocky sideloading heuristic)
+- **Actor / Campaign:** FamousSparrow (China-aligned)
+- **MITRE ATT&CK:** T1574.002 — Hijack Execution Flow: DLL Side-Loading
+- **Data source:** DeviceImageLoadEvents
+- **Source:** [9][10]
+
+```kql
+DeviceImageLoadEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("rundll32.exe","regsvr32.exe","mshta.exe","werfault.exe")
+| where FolderPath has_any (@"\AppData\Roaming\", @"\AppData\Local\Temp\", @"\ProgramData\", @"\Users\Public\")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, FolderPath
+| take 100
+```
+
+*Note:* SparroWocky is a modular C++ backdoor deployed by FamousSparrow against Latin American government targets since Aug 2025 [9][10]; the reporting does not include concrete file/hash IOCs, so this is a generic DLL side-loading heuristic used broadly by China-aligned actors — expect false positives from legitimate LOLBin usage and tune to your baseline.
+
+#### AWS AgentCore Harness credential/token retrieval following agent invocation (possible prompt-injection exfil)
+- **Actor / Campaign:** Unattributed (technique disclosure)
+- **MITRE ATT&CK:** T1552.005 — Unsecured Credentials: Cloud Instance Metadata API (adjacent) / T1651 — Cloud Administration Command (AI agent abuse)
+- **Data source:** AWSCloudTrail
+- **Source:** [2]
+
+```kql
+AWSCloudTrail
+| where TimeGenerated > ago(7d)
+| where EventSource has "bedrock-agentcore"
+| where EventName in ("GetWorkloadAccessToken","GetResourceApiKey","GetResourceOauth2Token","AssumeRole")
+| project TimeGenerated, EventName, UserIdentityArn, SourceIpAddress, AWSRegion, ErrorCode, RequestParameters
+| take 100
+```
+
+*Note:* Unit 42 found that AgentCore Harness default configurations can let prompt injection reach identity/credential retrieval APIs [2]; exact CloudTrail `EventName`/`EventSource` values may differ from those shown here — validate against your AWS AgentCore schema and baseline normal agent credential-fetch volume before alerting.
+
+> [1] WeaselBiscuit Stealer Spreads via 13 npm Packages to Harvest Chrome Extension Storage — https://thehackernews.com/2026/09/weaselbiscuit-stealer-spreads-via-13.html
+> [2] A Vault with a Heap-View: The Uncomfortable Space Between AgentCore Harness and Identity — https://unit42.paloaltonetworks.com/securing-aws-agentcore-harness-credentials/
+> [3] Claimed Bug Bounty Hunter Likely Used LLM to Build PhantomRaven npm Stealer — https://thehackernews.com/2026/09/claimed-bug-bounty-hunter-likely-used.html
+> [4] RatHat Android Malware Abuses ADB to Retain Shell Access After Uninstall — https://thehackernews.com/2026/09/rathat-android-malware-abuses-adb-to.html
+> [6] Iran-Linked Handala Hack Tied to HEAVYGRAM Telegram Backdoor That Can Steal Passwords — https://thehackernews.com/2026/09/iran-linked-handala-hack-tied-to.html
+> [9] China-Aligned FamousSparrow Deploys SparroWocky Backdoor Across Latin America — https://thehackernews.com/2026/09/china-aligned-famoussparrow-deploys.html
+> [10] Chinese hackers use SparroWocky malware in govt espionage attacks — https://www.bleepingcomputer.com/news/security/chinese-hackers-use-sparrowocky-malware-in-govt-espionage-attacks/
