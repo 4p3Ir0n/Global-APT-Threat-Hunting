@@ -6777,3 +6777,205 @@ AWSCloudTrail
 > [6] Iran-Linked Handala Hack Tied to HEAVYGRAM Telegram Backdoor That Can Steal Passwords — https://thehackernews.com/2026/09/iran-linked-handala-hack-tied-to.html
 > [9] China-Aligned FamousSparrow Deploys SparroWocky Backdoor Across Latin America — https://thehackernews.com/2026/09/china-aligned-famoussparrow-deploys.html
 > [10] Chinese hackers use SparroWocky malware in govt espionage attacks — https://www.bleepingcomputer.com/news/security/chinese-hackers-use-sparrowocky-malware-in-govt-espionage-attacks/
+
+### 2026-09-19
+
+*Generated 2026-09-19 13:24 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Rust backdoor tooling beaconing to GitHub-based C2 (Transparent Tribe)
+- **Actor / Campaign:** Transparent Tribe / APT36 (Earth Karkaddan) — Operation involving RUSTYSHADE, RUSTYMOVE, PSNATCH, BASHNATCH
+- **MITRE ATT&CK:** T1102.001 — Web Service: Dead Drop Resolver / T1105 — Ingress Tool Transfer
+- **Data source:** DeviceNetworkEvents, DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+// Hunt for unsigned/uncommon binaries reaching out to GitHub API/raw endpoints
+// (Transparent Tribe reportedly uses private GitHub repos as C2 for new Rust tooling)
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any ("api.github.com", "raw.githubusercontent.com", "github.io")
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName !in~ ("git.exe","git","GitHubDesktop.exe","chrome.exe","msedge.exe","firefox.exe")
+) on DeviceId, $left.InitiatingProcessId == $right.ProcessId
+| where InitiatingProcessFolderPath has_any ("\\Temp\\", "\\AppData\\", "/tmp/", "/var/tmp/")
+| project Timestamp, DeviceName, FileName, FolderPath, RemoteUrl, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Highly heuristic — tune folder-path and process allow-list to your environment; legitimate CI/CD or dev workflows will generate noise. No file hashes/names were published for RUSTYSHADE/RUSTYMOVE/PSNATCH/BASHNATCH, so this is purely behavioral.
+
+#### GitHub repo impersonation leading to Rapuncel infostealer execution
+- **Actor / Campaign:** unattributed — "Rapuncel" infostealer campaign
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Compromise Software Supply Chain / T1204.002 — User Execution: Malicious File
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [4]
+
+```kql
+// Look for git clone / zip download of repos referencing LastPass or Authenticator brand names
+// followed by local execution from user-writable paths (classic SEO-poisoned repo pattern)
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where (FileName in~ ("git.exe","git") and ProcessCommandLine has "clone")
+     or (ProcessCommandLine has_any ("LastPass", "Authenticator") and ProcessCommandLine has_any (".zip",".git"))
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine
+| join kind=inner (
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FolderPath has_any ("\\Downloads\\", "\\AppData\\Local\\Temp\\")
+    | where FileName endswith ".exe" or FileName endswith ".dll"
+) on DeviceId
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, DroppedFile=FileName, FolderPath
+| take 100
+```
+
+*Note:* No specific repo names, hashes, or file names were disclosed; tune the string match list to actual repo/brand names once IOCs are published, and expect FPs from legitimate LastPass installs.
+
+#### npm install harvesting Chrome extension local storage (WeaselBiscuit)
+- **Actor / Campaign:** unattributed — WeaselBiscuit stealer (overlaps with DPRK Contagious Interview / BeaverTail tradecraft)
+- **MITRE ATT&CK:** T1555.003 — Credentials from Password Stores: Credentials from Web Browsers / T1195.002 — Compromise Software Supply Chain
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [8]
+
+```kql
+// Detect node.exe (often spawned via npm postinstall) touching Chrome extension storage paths
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("npm.cmd","npm","node.exe","node")
+| project Timestamp, DeviceName, AccountName, ProcessId, InitiatingProcessCommandLine, ProcessCommandLine
+| join kind=inner (
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FolderPath has_any ("Local Extension Settings", "Extension State", "Local Storage\\leveldb")
+) on DeviceId
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, AccessedFile=FileName, FolderPath
+| take 100
+```
+
+*Note:* Legitimate browser extension developers/testers will trigger this; scope to hosts without a legitimate dev use case for Chrome extension internals, and correlate with recent `npm install` of unfamiliar packages.
+
+#### Suspicious npm postinstall script spawning network exfil (PhantomRaven-style)
+- **Actor / Campaign:** unattributed — PhantomRaven npm stealer (claimed bug-bounty hunter, LLM-authored)
+- **MITRE ATT&CK:** T1195.002 — Compromise Software Supply Chain / T1059.007 — Command and Scripting Interpreter: JavaScript
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [10]
+
+```kql
+// npm install immediately followed by outbound connection from node.exe to a non-registry host
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("npm.cmd","npm")
+| project InstallTime=Timestamp, DeviceId, DeviceName, AccountName, ProcessCommandLine
+| join kind=inner (
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where InitiatingProcessFileName in~ ("node.exe","node")
+    | where RemoteUrl !has "registry.npmjs.org"
+) on DeviceId
+| where NetworkTimestamp := Timestamp between (InstallTime .. InstallTime + 5m)
+| project InstallTime, Timestamp, DeviceName, AccountName, ProcessCommandLine, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* No package names/hashes were published; this hunts the generic "install then immediately phone home" pattern and needs an allow-list for known legitimate postinstall telemetry (e.g., Sentry, analytics SDKs).
+
+#### Continued source-code/API access from off-boarded employee credentials
+- **Actor / Campaign:** unattributed — CrowdSec breach via TanStack npm supply-chain attack
+- **MITRE ATT&CK:** T1078.004 — Valid Accounts: Cloud Accounts / T1199 — Trusted Relationship
+- **Data source:** SigninLogs, AuditLogs
+- **Source:** [2]
+
+```kql
+// Hunt for sign-ins / token use by accounts that should have been disabled at termination
+// but remained active (root cause of the CrowdSec repo-copy incident)
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| where UserId in (
+    // populate with your HR/offboarding feed of terminated-but-not-disabled accounts
+    datatable(UserId:string)[]
+)
+| project TimeGenerated, UserPrincipalName, AppDisplayName, IPAddress, Location, DeviceDetail
+| take 100
+```
+
+*Note:* This is a template requiring integration with an HR/offboarding data source to populate the terminated-account list; the underlying finding is a process gap (stale access), not a technical IOC.
+
+#### Anomalous credential retrieval following AI agent invocation (AWS AgentCore)
+- **Actor / Campaign:** unattributed — prompt-injection credential exfiltration via AWS AgentCore Harness default config
+- **MITRE ATT&CK:** T1552.005 — Unsecured Credentials: Cloud Instance Metadata API / T1098 — Account Manipulation (indirectly via stolen creds)
+- **Data source:** AWSCloudTrail
+- **Source:** [9]
+
+```kql
+// Look for secrets/credential retrieval or AssumeRole calls issued shortly after
+// an AgentCore/Bedrock agent invocation from the same identity/session
+AWSCloudTrail
+| where TimeGenerated > ago(14d)
+| where EventName in ("InvokeAgentRuntime", "InvokeAgent")
+| project InvokeTime=TimeGenerated, UserIdentityArn, SourceIpAddress
+| join kind=inner (
+    AWSCloudTrail
+    | where TimeGenerated > ago(14d)
+    | where EventName in ("GetSecretValue","AssumeRole","GetCredentialsForIdentity","GetSessionToken")
+) on UserIdentityArn
+| where TimeGenerated between (InvokeTime .. InvokeTime + 5m)
+| project InvokeTime, TimeGenerated, UserIdentityArn, SourceIpAddress, EventName, RequestParameters
+| take 100
+```
+
+*Note:* Requires the AWS CloudTrail connector in Sentinel; validate against your normal AgentCore role's baseline permission usage before alerting, as many legitimate agents do fetch credentials as part of their designed tool use.
+
+#### Privilege-escalation-style role changes on Azure AI Foundry resources
+- **Actor / Campaign:** unattributed — CVE-2026-85889 Azure AI Foundry missing-authentication flaw
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** AzureActivity
+- **Source:** [5]
+
+```kql
+// Hunt for unauthenticated/anomalous role or permission changes on AI Foundry / Cognitive Services resources
+AzureActivity
+| where TimeGenerated > ago(30d)
+| where ResourceProviderValue has_any ("Microsoft.CognitiveServices", "Microsoft.MachineLearningServices")
+| where OperationNameValue has_any ("roleAssignments/write", "write")
+| where ActivityStatusValue == "Success"
+| project TimeGenerated, Caller, CallerIpAddress, OperationNameValue, ResourceId, ActivityStatusValue
+| take 100
+```
+
+*Note:* Microsoft states no customer action is required (server-side fix), so this is precautionary; expect normal admin activity, so cross-reference with anomalous CallerIpAddress/first-time Caller.
+
+#### Kernel crash/oops indicators tied to actively exploited Linux CVEs
+- **Actor / Campaign:** unattributed — CISA KEV: CVE-2025-39964 (AF_ALG race condition), CVE-2026-53266 (ebtables SNAT OOB write), CVE-2025-39682 (TLS recvmsg zero-length record)
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** Syslog
+- **Source:** [6] [7] [11] [12] [13]
+
+```kql
+// Hunt for kernel oops/panic/BUG messages referencing the affected subsystems
+// (af_alg, ebtables/netfilter SNAT, TLS recvmsg) which may indicate exploitation attempts/crashes
+Syslog
+| where TimeGenerated > ago(14d)
+| where ProcessName has_any ("kernel","kern")
+| where SyslogMessage has_any ("af_alg", "ebtables", "BUG: KASAN", "general protection fault", "recvmsg", "tls_sw_recvmsg")
+| project TimeGenerated, Computer, SyslogMessage
+| take 100
+```
+
+*Note:* Linux kernel exploitation of these local-privesc/DoS bugs won't reliably produce syslog signatures on all distros/configs; this is a best-effort crash-artifact hunt — pair with patch/version inventory to identify still-vulnerable EoL/EoS hosts per the KEV entries.
+
+> [2] CrowdSec Says TanStack npm Attack Led to Copy of 170 Private GitHub Repositories — https://thehackernews.com/2026/09/crowdsec-says-tanstack-npm-attack-led.html
+> [3] Transparent Tribe Deploys New Rust Backdoor Using Private GitHub Repositories for C2 — https://thehackernews.com/2026/09/transparent-tribe-deploys-new-rust.html
+> [4] Fake LastPass Authenticator GitHub repos push new Rapuncel infostealer — https://www.bleepingcomputer.com/news/security/fake-lastpass-authenticator-github-repos-push-new-rapuncel-infostealer/
+> [5] Microsoft Patches CVSS 10.0 Azure AI Foundry Flaw Enabling Unauthorized Privilege Escalation — https://thehackernews.com/2026/09/microsoft-patches-cvss-100-azure-ai.html
+> [6] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/18/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [7] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/18/cisa-adds-one-known-exploited-vulnerability-catalog
+> [8] WeaselBiscuit Stealer Spreads via 13 npm Packages to Harvest Chrome Extension Storage — https://thehackernews.com/2026/09/weaselbiscuit-stealer-spreads-via-13.html
+> [9] A Vault with a Heap-View: The Uncomfortable Space Between AgentCore Harness and Identity — https://unit42.paloaltonetworks.com/securing-aws-agentcore-harness-credentials/
+> [10] Claimed Bug Bounty Hunter Likely Used LLM to Build PhantomRaven npm Stealer — https://thehackernews.com/2026/09/claimed-bug-bounty-hunter-likely-used.html
+> [11] CVE-2025-39964 — Linux Kernel Race Condition Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2025-39964
+> [12] CVE-2026-53266 — Linux Kernel Out-of-Bounds Write Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-53266
+> [13] CVE-2025-39682 — Linux Kernel Improper Check for Unusual or Exceptional Conditions Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2025-39682
