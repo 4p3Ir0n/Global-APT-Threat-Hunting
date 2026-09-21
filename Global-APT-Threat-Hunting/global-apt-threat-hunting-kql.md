@@ -6989,3 +6989,180 @@ _Lint: no KQL blocks detected._
 _No detectable material in today's reporting._
 
 > [1] Viral AI actress' hotline face-scans every caller, watches their mood — https://www.bleepingcomputer.com/news/security/viral-ai-actress-hotline-face-scans-every-caller-watches-their-mood/
+
+### 2026-09-21
+
+*Generated 2026-09-21 13:27 UTC · model `claude-sonnet-5`*
+
+_Lint: 9 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### PNG Steganography Payload Extraction Behavior (TerminalFix)
+- **Actor / Campaign:** TerminalFix (unattributed threat actor, per Microsoft Security Research)
+- **MITRE ATT&CK:** T1027.003 — Obfuscated Files or Information: Steganography
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [1]
+
+```kql
+// No concrete file/hash IOCs published in this diary; hunting for the behavior of
+// scripting engines parsing/extracting data from PNG files (steganographic payload extraction)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("powershell.exe", "pwsh.exe", "python.exe", "cscript.exe", "wscript.exe")
+| where ProcessCommandLine has ".png"
+| where ProcessCommandLine has_any ("FromBase64", "Convert.", "System.Drawing", "Image.FromFile", "zlib", "gzip", "MemoryStream", "byte[]")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, AccountName
+| take 100
+```
+
+*Note:* Highly heuristic — legitimate image-processing scripts will trigger this. Tune by pairing with subsequent outbound network activity or process spawning (reverse tunnel) from the same host within a short window.
+
+#### Suspicious Reverse Tunnel Process Chain Following PNG Access
+- **Actor / Campaign:** TerminalFix
+- **MITRE ATT&CK:** T1572 — Protocol Tunneling
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// Look for a process that recently touched a PNG file, then shortly after establishes
+// an outbound connection consistent with a tunneling client (behavioral, no IOC available)
+let pngTouches = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName endswith ".png"
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessId;
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName !in~ ("chrome.exe","msedge.exe","firefox.exe","explorer.exe")
+| join kind=inner pngTouches on DeviceName, InitiatingProcessId
+| where DeviceNetworkEvents.Timestamp between (pngTouches.Timestamp .. pngTouches.Timestamp + 15m)
+| project DeviceNetworkEvents.Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* Purely correlative/behavioral due to lack of published IOCs; expect noise and refine with EDR alerting on known tunneling tool names once IOCs are released.
+
+#### ClickFix Lure Delivering ChainScript RAT via Known Build Names
+- **Actor / Campaign:** ChainScript RAT (Blackpoint APG reporting)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste (ClickFix); S0000/T1036 — Masquerading
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any ("ComponentTask33", "UpdateDigital", "HostShared", "OrchidViolet66")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, AccountName
+| take 100
+```
+
+*Note:* Direct string match on reported ChainScript build/campaign names; low FP expected but names may rotate in future builds — treat as tactical/short-lived.
+
+#### ClickFix Pattern: Run-Dialog / Clipboard-Paste Execution to Fake Software Installer
+- **Actor / Campaign:** ChainScript RAT
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste; T1027 — Obfuscated Files or Information
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("explorer.exe", "RuntimeBroker.exe")
+| where FileName in~ ("mshta.exe", "powershell.exe", "cmd.exe", "wscript.exe")
+| where ProcessCommandLine has_any ("Spotify", "Zoom", "Teams") and ProcessCommandLine has_any ("iex", "-w hidden", "-enc", "downloadstring", "curl", "invoke-webrequest")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Classic ClickFix behavioral signature (fake update/software prompt driving Run-dialog paste-and-execute); validate against legitimate app-update scripting to reduce FPs.
+
+#### Non-Browser Process Contacting Polygon/Blockchain RPC Endpoints (C2 Rotation)
+- **Actor / Campaign:** ChainScript RAT
+- **MITRE ATT&CK:** T1102 — Web Service; T1568 — Dynamic Resolution
+- **Data source:** DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemoteUrl has_any ("polygon-rpc.com", "polygonscan.com", "alchemyapi.io", "infura.io")
+| where InitiatingProcessFileName !in~ ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* ChainScript reportedly uses Polygon smart contracts to rotate C2 addresses; flag non-browser processes (RATs, scripting hosts) making these calls. Developer tooling (wallets, dApp dev environments) will cause FPs — scope to endpoints without expected blockchain dev use.
+
+#### Jade Sleet Developer-Targeting: macOS LaunchAgent/LaunchDaemon Persistence from Scripting Shells
+- **Actor / Campaign:** Jade Sleet (DPRK) — FLATROOF / ROOFDECK backdoors
+- **MITRE ATT&CK:** T1543.001 — Create or Modify System Process: Launch Agent; T1204.002 — User Execution: Malicious File
+- **Data source:** DeviceFileEvents, DeviceProcessEvents (macOS)
+- **Source:** [3]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any ("/Library/LaunchAgents", "/Library/LaunchDaemons", "/Users/") and FolderPath has "LaunchAgents"
+| where FileName endswith ".plist"
+| where InitiatingProcessFileName in~ ("bash", "zsh", "sh", "curl", "osascript", "python3")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Jade Sleet historically targets developers via fake coding challenges/interview lures leading to macOS persistence; scope to dev-fleet macOS assets and correlate with recent npm/git activity to cut noise.
+
+#### Jade Sleet Lure Pattern: Developer Tooling Spawned From Downloaded Archives/Scripts
+- **Actor / Campaign:** Jade Sleet — FLATROOF / ROOFDECK
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("Terminal", "iTerm2", "bash", "zsh")
+| where ProcessCommandLine has_any ("git clone", "npm install", "curl -O", "chmod +x")
+| where FolderPath has_any ("/tmp/", "/Downloads/", "/private/tmp/")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* No public hashes/domains for FLATROOF/ROOFDECK in this report; this is a generic behavioral hunt for the "fake coding test / malicious repo" delivery pattern this actor is known for — expect legitimate developer noise and tune per environment.
+
+#### npm Runtime-Phase Malicious Behavior (indexed-btree Package Pattern)
+- **Actor / Campaign:** Unattributed npm supply-chain campaign
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Compromise Software Supply Chain; T1059.007 — JavaScript
+- **Data source:** DeviceFileEvents, DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [4]
+
+```kql
+// Direct hit on named malicious package path
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has @"node_modules\indexed-btree" or FolderPath has "node_modules/indexed-btree"
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Exact package-name match for the reported case; low FP but campaign is described as "ongoing" so other package names will follow — pair with the generic Node runtime-anomaly query below.
+
+#### Generic: Node.js Runtime Spawning Shell/Network Tools (Post-Install Malicious Behavior)
+- **Actor / Campaign:** Unattributed npm supply-chain campaign
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "node.exe" or InitiatingProcessFileName =~ "node"
+| where FileName in~ ("cmd.exe", "powershell.exe", "bash", "sh", "curl.exe", "wget")
+| where InitiatingProcessFolderPath has "node_modules"
+| project Timestamp, DeviceName, InitiatingProcessFolderPath, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Detects malicious code executed during a Node package's normal runtime (not install-script) spawning shells/network tools — the technique described in the report; legitimate build tooling (webpack, gulp) can trigger this, so baseline expected child-process behavior per environment before alerting.
+
+> [1] TerminalFix: PNG Steganography — https://isc.sans.edu/diary/rss/33318
+> [2] ClickFix Lures Deploy ChainScript RAT Using Polygon to Rotate C2 Infrastructure — https://thehackernews.com/2026/09/clickfix-lures-deploy-chainscript-rat.html
+> [3] Jade Sleet Linked to Indian IT Provider Breach With FLATROOF and ROOFDECK Backdoors — https://thehackernews.com/2026/09/jade-sleet-linked-to-indian-it-provider.html
+> [4] Malicious npm packages evade install-script defenses at runtime — https://www.bleepingcomputer.com/news/security/malicious-npm-packages-evade-install-script-defenses-at-runtime/
