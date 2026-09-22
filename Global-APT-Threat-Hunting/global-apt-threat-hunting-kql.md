@@ -7166,3 +7166,178 @@ DeviceProcessEvents
 > [2] ClickFix Lures Deploy ChainScript RAT Using Polygon to Rotate C2 Infrastructure — https://thehackernews.com/2026/09/clickfix-lures-deploy-chainscript-rat.html
 > [3] Jade Sleet Linked to Indian IT Provider Breach With FLATROOF and ROOFDECK Backdoors — https://thehackernews.com/2026/09/jade-sleet-linked-to-indian-it-provider.html
 > [4] Malicious npm packages evade install-script defenses at runtime — https://www.bleepingcomputer.com/news/security/malicious-npm-packages-evade-install-script-defenses-at-runtime/
+
+### 2026-09-22
+
+*Generated 2026-09-22 13:28 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### SideCopy Spear-Phishing via mshta.exe Against Academic Targets
+- **Actor / Campaign:** SideCopy
+- **MITRE ATT&CK:** T1218.005 — Signed Binary Proxy Execution: Mshta
+- **Data source:** DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "mshta.exe"
+| where ProcessCommandLine has_any ("http://", "https://", ".hta")
+| where InitiatingProcessFileName in~ ("winword.exe","excel.exe","outlook.exe","explorer.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* mshta.exe launching remote/HTA payloads from an Office process or explorer is highly suspicious; legitimate mshta use is rare — tune out known internal HTA tooling.
+
+#### TASK#STOMP PowerShell Backdoor — Wi-Fi/Clipboard/Screenshot Harvesting
+- **Actor / Campaign:** unattributed (TASK#STOMP campaign)
+- **MITRE ATT&CK:** T1552.001 / T1115 / T1113 — Credentials in Files, Clipboard Data, Screen Capture (PowerShell-based)
+- **Data source:** DeviceProcessEvents
+- **Source:** [10]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "powershell.exe" or FileName =~ "pwsh.exe"
+| where ProcessCommandLine has_any (
+    "netsh wlan show profile",
+    "key=clear",
+    "Get-Clipboard",
+    "System.Windows.Forms.Clipboard",
+    "CopyFromScreen"
+  )
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Combination of Wi-Fi profile dumping + clipboard/screenshot APIs in one script is a strong TASK#STOMP indicator; single-hit matches (e.g. IT scripts calling netsh wlan) should be reviewed for legitimacy.
+
+#### ChainScript RAT — Software-Masquerading Binaries from ClickFix Lures
+- **Actor / Campaign:** unattributed (ChainScript / ClickFix)
+- **MITRE ATT&CK:** T1204.004 / T1036.005 — ClickFix-style User Execution, Masquerading
+- **Data source:** DeviceProcessEvents
+- **Source:** [13]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("Spotify.exe","Zoom.exe","Teams.exe","MicrosoftTeams.exe")
+| where FolderPath has_any (@"\Temp\", @"\Downloads\", @"\AppData\Local\Temp\")
+| where InitiatingProcessFileName in~ ("explorer.exe","cmd.exe","powershell.exe","mshta.exe","rundll32.exe")
+| project Timestamp, DeviceName, AccountName, FileName, FolderPath, InitiatingProcessFileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* ChainScript build names (ComponentTask33, UpdateDigital, HostShared, OrchidViolet66) impersonate popular apps but run from non-standard paths; add those literal internal build names to `FileName`/`ProcessCommandLine` filters if seen in your environment.
+
+#### TerminalFix — PNG Steganography Delivery Followed by Reverse Tunnel Activity
+- **Actor / Campaign:** unattributed (TerminalFix campaign)
+- **MITRE ATT&CK:** T1027.003 / T1572 — Steganography, Protocol Tunneling
+- **Data source:** DeviceFileEvents, DeviceNetworkEvents, DeviceProcessEvents
+- **Source:** [12]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName endswith ".png"
+| where FolderPath has_any (@"\Downloads\", @"\Temp\", @"\AppData\")
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where ProcessCommandLine has_any ("tunnel","reverse","-R ","ssh ","ngrok")
+  ) on DeviceId
+| where DeviceFileEvents.Timestamp < DeviceProcessEvents.Timestamp
+| project DeviceFileEvents.Timestamp, DeviceName, FileName, FolderPath, ProcessCommandLine, DeviceProcessEvents.Timestamp
+| take 100
+```
+
+*Note:* Heuristic pairing of a recently-dropped PNG with subsequent tunneling command lines on the same host; legitimate remote-access tooling (ngrok, ssh) will need environment-specific allow-listing.
+
+#### Contagious Interview — Crypto-Wallet & Extension Storage Access After Fake Job Lure
+- **Actor / Campaign:** Contagious Interview (North Korea-nexus)
+- **MITRE ATT&CK:** T1555.003 / T1204.002 — Credentials from Browser Storage, User Execution: Malicious File
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any (
+    @"\Local Extension Settings\nkbihfbeogaeaoehlefnkodbefgpgknn", // MetaMask
+    @"\Local Extension Settings\bfnaelmomeimhlpmgjnjophhpkkoljpa", // Phantom
+    @"Ledger Live",
+    @"Exodus"
+  )
+| where InitiatingProcessFileName in~ ("node.exe","npm.cmd","python.exe","powershell.exe")
+| project Timestamp, DeviceName, AccountName, FolderPath, FileName, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Flags non-browser processes reading crypto-wallet extension storage — a pattern consistent with Contagious Interview credential/wallet theft; validate against legitimate wallet backup/sync tools.
+
+#### Malicious npm Package Install — indexed-btree Loader Pattern
+- **Actor / Campaign:** unattributed (npm supply-chain)
+- **MITRE ATT&CK:** T1195.002 — Compromise Software Supply Chain
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [5]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("npm.cmd","npm.exe","node.exe")
+| where ProcessCommandLine has "indexed-btree"
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Exact package-name match is a low-noise starting point; extend with DeviceFileEvents on `node_modules\indexed-btree` paths since the package hides its loader in runtime code rather than install scripts, so behavior at require()-time is more indicative than install-time.
+
+#### Windows Defender Update-Blocking Zero-Day Exploitation Attempt
+- **Actor / Campaign:** unattributed (public PoC by Naceri / "Nightmare Eclipse")
+- **MITRE ATT&CK:** T1562.001 — Impair Defenses: Disable or Modify Tools
+- **Data source:** DeviceRegistryEvents, DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+DeviceRegistryEvents
+| where Timestamp > ago(14d)
+| where RegistryKey has_any (
+    @"SOFTWARE\Microsoft\Windows Defender\Signature Updates",
+    @"SOFTWARE\Policies\Microsoft\Windows Defender"
+  )
+| where ActionType in ("RegistryValueSet","RegistryKeySet")
+| project Timestamp, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+| take 100
+```
+
+*Note:* No public IOC/exploit binary name is confirmed in the source, so this is behavior-based on the known effect (blocking Defender signature updates); expect FPs from legitimate GPO/Defender management tools and correlate with unexpected process context (non-MDM/non-admin initiator).
+
+#### Zyxel GS1900 KEV (CVE-2026-7273) — CGI Exploitation Probe Against Switch Management Interface
+- **Actor / Campaign:** unattributed (CISA KEV, actively exploited)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceNetworkEvents / firewall or proxy logs (SecurityEvent as fallback)
+- **Source:** [11] [14]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemotePort in (80, 443)
+| where AdditionalFields has "cgi" // adjust to your proxy/URL-logging field if HTTP path not captured natively
+| where RemoteUrl has_any ("/cgi-bin/", "GS1900")
+| project Timestamp, DeviceName, LocalIP, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* EDR tables rarely capture full HTTP request paths to embedded-device management UIs; this is best implemented against firewall/proxy/NDR logs that log URI paths — treat the KQL above as a template and adapt table/fields to your network telemetry source, prioritizing internet-exposed Zyxel GS1900 management interfaces per CISA BOD 26-04.
+
+> [4] New Windows Defender zero-day blocks Microsoft antivirus updates — https://www.bleepingcomputer.com/news/security/new-windows-defender-zero-day-blocks-microsoft-antivirus-updates/
+> [5] Malicious npm Package indexed-btree Hid Its Loader in Runtime Code Before Removal — https://thehackernews.com/2026/09/malicious-npm-package-indexed-btree-hid.html
+> [6] SideCopy Broadens India Targeting to Academia With ReverseRAT Spear-Phishing — https://thehackernews.com/2026/09/sidecopy-broadens-india-targeting-to.html
+> [8] Contagious Interview Campaign Compromises 30,000 Devices, Steals $10.71M in Crypto — https://thehackernews.com/2026/09/contagious-interview-campaign.html
+> [10] TASK#STOMP PowerShell Backdoor Steals Documents, Wi-Fi Passwords, and Clipboard Data — https://thehackernews.com/2026/09/taskstomp-powershell-backdoor-steals.html
+> [11] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/21/cisa-adds-one-known-exploited-vulnerability-catalog
+> [12] TerminalFix: PNG Steganography — https://isc.sans.edu/diary/rss/33318
+> [13] ClickFix Lures Deploy ChainScript RAT Using Polygon to Rotate C2 Infrastructure — https://thehackernews.com/2026/09/clickfix-lures-deploy-chainscript-rat.html
+> [14] CVE-2026-7273 — Zyxel GS1900 Series Switches Stack-Based Buffer Overflow Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-7273
