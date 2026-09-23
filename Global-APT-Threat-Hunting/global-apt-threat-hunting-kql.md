@@ -7341,3 +7341,173 @@ DeviceNetworkEvents
 > [12] TerminalFix: PNG Steganography — https://isc.sans.edu/diary/rss/33318
 > [13] ClickFix Lures Deploy ChainScript RAT Using Polygon to Rotate C2 Infrastructure — https://thehackernews.com/2026/09/clickfix-lures-deploy-chainscript-rat.html
 > [14] CVE-2026-7273 — Zyxel GS1900 Series Switches Stack-Based Buffer Overflow Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-7273
+
+### 2026-09-23
+
+*Generated 2026-09-23 13:28 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Chrome Renderer Spawning Unexpected Child Process (UTA0565 Chrome/Windows Zero-Day Chain)
+- **Actor / Campaign:** UTA0565 (Chinese threat actor, CLEANGULP malware)
+- **MITRE ATT&CK:** T1189 — Drive-by Compromise; T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+// Chrome should very rarely spawn interpreters/shells directly; the CVE-2026-85046/87491/85880
+// chain uses a Chrome sandbox escape + Windows ALPC bug to break out to arbitrary code execution.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "chrome.exe"
+| where FileName in~ ("cmd.exe","powershell.exe","powershell_ise.exe","rundll32.exe","mshta.exe","wscript.exe","cscript.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Legitimate Chrome-initiated launches (file "Open with", extension helpers) can trigger this; validate parent process tree and check for the same-day patch level of Chrome/Windows against the disclosed CVEs before escalating.
+
+#### mshta.exe Executing Remote Script (SideCopy ReverseRAT TTP)
+- **Actor / Campaign:** SideCopy
+- **MITRE ATT&CK:** T1218.005 — System Binary Proxy Execution: Mshta
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [20]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "mshta.exe"
+| where ProcessCommandLine has_any ("http://", "https://", ".hta")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* SideCopy's stated pattern is mshta abuse from spear-phish lures targeting Indian academia/government; correlate with newly-observed email attachments or LNK/HTA droppers on the same host.
+
+#### Device-Code Authorization Flow Sign-Ins (EvilTokens-style Phishing)
+- **Actor / Campaign:** EvilTokens device-code phishing service (disrupted by Microsoft)
+- **MITRE ATT&CK:** T1528 — Steal Application Access Token; T1566 — Phishing
+- **Data source:** SigninLogs (Microsoft Entra ID)
+- **Source:** [9]
+
+```kql
+// Device code auth flow is legitimate but heavily abused for phishing; hunt for spikes/anomalies.
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where AuthenticationProtocol == "deviceCode"   // confirm this value exists in your tenant schema
+| summarize Attempts=count(), Apps=make_set(AppDisplayName), IPs=make_set(IPAddress) by UserPrincipalName, bin(TimeGenerated, 1h)
+| where Attempts > 3
+| take 100
+```
+
+*Note:* Device code flow is used by legitimate CLI/IoT sign-ins too; tune by baselining known device-code-consuming apps and flag unfamiliar AppDisplayName values or unusual source geographies/ASNs.
+
+#### Rapid Mass Disk-Filling Consistent with BigDiskBuster Defender-Update Blocker
+- **Actor / Campaign:** unattributed (public PoC "BigDiskBuster" by A. Naceri)
+- **MITRE ATT&CK:** T1562.001 — Impair Defenses: Disable or Modify Tools
+- **Data source:** DeviceFileEvents
+- **Source:** [11] [18]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(1d)
+| where ActionType == "FileCreated"
+| summarize TotalBytes = sum(FileSize), FileCount = count() by DeviceName, bin(Timestamp, 10m)
+| where TotalBytes > 5000000000  // ~5GB in 10 min — tune to normal disk-write baseline
+| order by TotalBytes desc
+| take 100
+```
+
+*Note:* No CVE/patch exists yet; this is a coarse heuristic for abnormal storage consumption — pair with Defender platform/signature update-failure telemetry (e.g., MpCmdRun / Update Health events) for higher confidence.
+
+#### Node.js Outbound Connection Shortly After npm Install (Hidden Loader Pattern)
+- **Actor / Campaign:** unattributed npm supply-chain package "indexed-btree"
+- **MITRE ATT&CK:** T1195.002 — Compromise Software Supply Chain
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [19]
+
+```kql
+let InstallEvents = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("npm.cmd","npm","node.exe")
+| where ProcessCommandLine has "install";
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "node.exe"
+| join kind=inner (InstallEvents) on DeviceId
+| where (Timestamp - Timestamp1) between (0s .. 5m)
+| project Timestamp, DeviceName, RemoteUrl, RemoteIP, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* No lifecycle-script hook is used by this loader, so classic "postinstall" detections will miss it; this behavioral query looks for node.exe network activity closely following an npm install — expect noise from legitimate packages that phone-home telemetry/registries, so tune the time window and allow-list known-good domains.
+
+#### Suspicious Shell/Script Execution from VeloCloud Orchestrator Process (CVE-2026-93952)
+- **Actor / Campaign:** unattributed exploitation of Arista VCO (KEV-listed)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents (if VCO host has endpoint telemetry)
+- **Source:** [1] [13] [14] [21]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("java","tomcat","catalina")
+| where FileName in~ ("bash","sh","curl","wget","python","python3","nc","ncat")
+| where DeviceName has_any ("vco","velocloud","orchestrator")   // adjust to your on-prem VCO hostnames
+| project Timestamp, DeviceName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* VCO on-prem appliances often lack standard EDR agents; if this table returns nothing, hunt instead in VCO application/web-access logs for unauthenticated requests to certificate-enrollment/privileged internal endpoints, and prioritize patching per CISA KEV [14].
+
+#### Path Traversal / Script Upload Attempts Against Check Point Management Server (CVE-2026-93616)
+- **Actor / Campaign:** unattributed targeted exploitation (Check Point disclosed July 23 attacks)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1105 — Ingress Tool Transfer
+- **Data source:** CommonSecurityLog (Syslog/CEF from Check Point management appliance)
+- **Source:** [8] [10] [14] [23]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor has "Check Point"
+| where RequestURL has_any ("../", "..%2f", "..%5c")
+| project TimeGenerated, DeviceVendor, SourceIP, DestinationIP, RequestURL
+| take 100
+```
+
+*Note:* No confirmed exploitation URI was published; this is a generic path-traversal heuristic — validate against your CEF schema field names and prioritize investigation of any unauthenticated hits against the management web service, per KEV requirement [14].
+
+#### Anomalous Large-Payload Requests to F5 BIG-IP APM OAuth Endpoint (CVE-2026-94127)
+- **Actor / Campaign:** unattributed exploitation of F5 BIG-IP APM (KEV-listed)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (Syslog/CEF from BIG-IP), DeviceNetworkEvents
+- **Source:** [3] [5] [14] [22]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor has "F5"
+| where RequestURL has_any ("/oauth", "/f5-oauth2", "/mgmt")   // adjust to your APM OAuth server paths
+| summarize RequestCount = count(), AvgBytes = avg(toint(ReceivedBytes)) by SourceIP, DestinationIP, bin(TimeGenerated, 5m)
+| where AvgBytes > 100000   // large requests consistent with heap overflow attempts — tune to baseline
+| take 100
+```
+
+*Note:* Heap-overflow exploitation traffic signatures are not published in this reporting; this is a coarse volumetric heuristic for BIG-IP APM systems configured as OAuth authorization servers — patch/hotfix per vendor advisory is the primary mitigation [14].
+
+> [1] Arista patches actively exploited VeloCloud Orchestrator zero-day — https://www.bleepingcomputer.com/news/security/arista-patches-actively-exploited-velocloud-orchestrator-zero-day/
+> [3] F5 Patches Critical BIG-IP APM Zero-Day Exploited for Unauthenticated RCE on OAuth Servers — https://thehackernews.com/2026/09/f5-patches-critical-big-ip-apm-zero-day.html
+> [4] Chinese Hackers Exploit Chrome-Windows Zero-Day Chain to Deploy CLEANGULP Malware — https://thehackernews.com/2026/09/chinese-hackers-exploit-chrome-windows.html
+> [5] F5 patches BIG-IP APM zero-day flaw exploited in RCE attacks — https://www.bleepingcomputer.com/news/security/f5-warns-of-big-ip-apm-remote-code-execution-zero-day-exploited-in-attacks/
+> [8] Check Point Warns of Management Server Zero-Day Exploited in Targeted Attacks — https://thehackernews.com/2026/09/check-point-warns-of-management-server.html
+> [9] Microsoft Takes Down EvilTokens Device-Code Phishing Service Tied to 12,000 Inbox Compromises — https://thehackernews.com/2026/09/microsoft-takes-down-eviltokens-device.html
+> [10] Check Point warns of Management Server zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/check-point-patches-management-server-zero-day-exploited-in-attacks/
+> [11] Researcher Drops BigDiskBuster Zero-Day PoC That Blocks Microsoft Defender Updates — https://thehackernews.com/2026/09/researcher-drops-bigdiskbuster-zero-day.html
+> [13] New CVSS 10.0 VeloCloud Orchestrator Flaw Actively Exploited in Certificate-Based Setups — https://thehackernews.com/2026/09/new-cvss-100-velocloud-orchestrator.html
+> [14] CISA Adds Four Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/22/cisa-adds-four-known-exploited-vulnerabilities-catalog
+> [18] New Windows Defender zero-day blocks Microsoft antivirus updates — https://www.bleepingcomputer.com/news/security/new-windows-defender-zero-day-blocks-microsoft-antivirus-updates/
+> [19] Malicious npm Package indexed-btree Hid Its Loader in Runtime Code Before Removal — https://thehackernews.com/2026/09/malicious-npm-package-indexed-btree-hid.html
+> [20] SideCopy Broadens India Targeting to Academia With ReverseRAT Spear-Phishing — https://thehackernews.com/2026/09/sidecopy-broadens-india-targeting-to.html
+> [21] CVE-2026-93952 — Arista VeloCloud Orchestrator — https://nvd.nist.gov/vuln/detail/CVE-2026-93952
+> [22] CVE-2026-94127 — F5 BIG-IP APM — https://nvd.nist.gov/vuln/detail/CVE-2026-94127
+> [23] CVE-2026-93616 — Check Point Multiple Products — https://nvd.nist.gov/vuln/detail/CVE-2026-93616
