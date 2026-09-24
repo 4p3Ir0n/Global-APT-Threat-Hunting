@@ -7511,3 +7511,178 @@ CommonSecurityLog
 > [21] CVE-2026-93952 — Arista VeloCloud Orchestrator — https://nvd.nist.gov/vuln/detail/CVE-2026-93952
 > [22] CVE-2026-94127 — F5 BIG-IP APM — https://nvd.nist.gov/vuln/detail/CVE-2026-94127
 > [23] CVE-2026-93616 — Check Point Multiple Products — https://nvd.nist.gov/vuln/detail/CVE-2026-93616
+
+### 2026-09-24
+
+*Generated 2026-09-24 13:27 UTC · model `claude-sonnet-5`*
+
+_Lint: 10 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### MacSync macOS stealer/backdoor – crypto wallet access & persistence
+- **Actor / Campaign:** unattributed (MacSync stealer, targets crypto users/developers)
+- **MITRE ATT&CK:** T1555.003 — Credentials from Web Browsers / T1547.011 — Boot or Logon Autostart: Plist Modification / T1005 — Data from Local System
+- **Data source:** DeviceFileEvents, DeviceProcessEvents (macOS)
+- **Source:** [1]
+
+```kql
+// Heuristic: LaunchAgent/LaunchDaemon plist creation followed by access to crypto wallet directories
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where DeviceOs == "MacOS" or FolderPath has "/Library/LaunchAgents/"
+| where FolderPath has_any ("/Library/LaunchAgents/", "/Library/LaunchDaemons/")
+| where FileName endswith ".plist"
+| join kind=inner (
+    DeviceFileEvents
+    | where Timestamp > ago(7d)
+    | where FolderPath has_any (
+        "Exodus", "Electrum", "Ledger Live", "Wallet", "Keychain", "MetaMask"
+    )
+) on DeviceId
+| project Timestamp, DeviceId, DeviceName, PlistFile=FileName, WalletFolder=FolderPath1
+| take 100
+```
+
+*Note:* No IOCs (hashes/domains) were published for MacSync; this is a pure behavioral heuristic (persistence + wallet access co-occurrence) and needs tuning against legitimate crypto-app installers on developer machines.
+
+#### ClickFix-style clipboard-paste execution via Run dialog
+- **Actor / Campaign:** Multiple / ClickFix-as-a-service (per CTM360)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste / T1059.001 — PowerShell
+- **Data source:** DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName =~ "explorer.exe"   // classic ClickFix: pasted into Win+R, no browser parent
+| where FileName in~ ("powershell.exe","pwsh.exe","mshta.exe","cmd.exe","wscript.exe","cscript.exe")
+| where ProcessCommandLine has_any ("http://","https://","-enc","-w hidden","IEX","Invoke-Expression","curl","certutil")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* ClickFix has no fixed IOC list per the report; this hunts the process-tree signature (Run dialog → interpreter with a URL/download command) and needs allow-listing for legitimate IT scripts.
+
+#### WordPress CVE-2026-87902 webshell drop via page-template LFI
+- **Actor / Campaign:** unattributed, mass opportunistic exploitation
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1505.003 — Web Shell
+- **Data source:** DeviceFileEvents, DeviceProcessEvents (on IIS/Apache/PHP web servers)
+- **Source:** [3][5]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(2d)
+| where FolderPath has "wp-content"
+| where FileName endswith ".php"
+| where ActionType in ("FileCreated","FileModified")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+```kql
+// Companion: PHP process spawning a shell right after web request (indicates exploitation of get_page_template())
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where InitiatingProcessFileName has_any ("php-cgi.exe","php.exe","php-fpm")
+| where FileName in~ ("cmd.exe","powershell.exe","sh","bash")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* No specific webshell filename/hash was published; look for newly written `.php` files in `wp-content` and PHP-worker-to-shell spawns on internet-facing WordPress hosts patched after CVE-2026-87902 disclosure.
+
+#### Malicious Terraform providers / Go modules from HashiCorp Registry
+- **Actor / Campaign:** unattributed supply-chain actor
+- **MITRE ATT&CK:** T1195.002 — Compromise Software Supply Chain / T1204.003 — User Execution: Malicious Third-Party Component
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [6]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any ("gocommunity-io/dockerd", "kreuzwenker", "terraform init", "terraform providers")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "terraform.exe" or InitiatingProcessFileName =~ "terraform"
+| where RemoteUrl has "registry.terraform.io"
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* Named malicious providers (`gocommunity-io/dockerd`, `kreuzwenker/*`) came from Aikido's disclosure; add the full provider/module names once confirmed and pivot on CI/CD build agents, not developer laptops, for best signal.
+
+#### Compromised MemTensor npm/PyPI packages delivering sckit implant
+- **Actor / Campaign:** unattributed npm/PyPI supply-chain compromise
+- **MITRE ATT&CK:** T1195.002 — Compromise Software Supply Chain / T1552.001 — Unsecured Credentials
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [9]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any (
+    "@memtensor/memos-cloud-openclaw-plugin", "memtensor", "sckit"
+)
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "sckit" or FileName has "sckit"
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Package/version list is only partially quoted in the source; extend the `has_any` list with exact compromised versions once fully published, and expect cross-platform (Win/Linux/macOS) hits given sckit is a Go implant.
+
+#### F5 BIG-IP APM CVE-2026-94127 – anomalous unauthenticated OAuth token requests
+- **Actor / Campaign:** unattributed, exploiting BIG-IP APM as OAuth authorization server
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog / AzureDiagnostics (F5 syslog, if ingested)
+- **Source:** [12]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(2d)
+| where DeviceVendor has "F5" or Activity has_any ("APM","oauth")
+| where RequestURL has_any ("/oauth/token","/oauth/authorize","/apm")
+| summarize RequestCount=count(), Sources=make_set(SourceIP) by DestinationIP, RequestURL, bin(TimeGenerated, 5m)
+| where RequestCount > 20
+| take 100
+```
+
+*Note:* No F5-specific payload/IOC was released; this hunts for volumetric/anomalous probing of APM OAuth endpoints. Requires F5 syslog ingestion into Sentinel — confirm log source schema before relying on field names.
+
+#### Chinese UTA0565 Chrome-Windows zero-day chain deploying CLEANGULP
+- **Actor / Campaign:** UTA0565 (Chinese state-linked)
+- **MITRE ATT&CK:** T1189 — Drive-by Compromise / T1068 — Exploitation for Privilege Escalation / T1055 — Process Injection
+- **Data source:** DeviceProcessEvents, DeviceImageLoadEvents
+- **Source:** [13]
+
+```kql
+// Sandbox-escape signature: browser renderer spawning unexpected system processes shortly after visiting an external site
+DeviceProcessEvents
+| where Timestamp > ago(3d)
+| where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe")
+| where FileName in~ ("rundll32.exe","cmd.exe","powershell.exe","werfault.exe","conhost.exe")
+| where InitiatingProcessIntegrityLevel in ("Low","AppContainer")   // renderer sandbox integrity escaping to higher level
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessIntegrityLevel, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* CVE-2026-85046/87491 (Chrome) + CVE-2026-85880 (Windows ALPC) were used as zero-days against fake websites on Sept 3–4, 2026; no CLEANGULP file/hash IOCs were given, so this hunts the generic sandbox-escape process-tree pattern and will need heavy tuning to cut Chrome crash-reporter false positives.
+
+> [1] MacSync under the microscope: new delivery methods and a new payload — https://securelist.com/macsync-new-version/121383/
+> [2] 17,000 URLs Reveal How ClickFix Turns Trusted Websites Into Malware Traps: Report by CTM360 — https://thehackernews.com/2026/09/17000-urls-reveal-how-clickfix-turns.html
+> [3] Attackers Exploit WordPress CVE-2026-87902 Within Hours of Disclosure — https://thehackernews.com/2026/09/attackers-exploit-wordpress-cve-2026.html
+> [5] Hackers start exploiting critical WordPress flaw for code execution — https://www.bleepingcomputer.com/news/security/hackers-start-exploiting-critical-wordpress-flaw-for-code-execution/
+> [6] Attackers Use Malicious Terraform Providers to Deliver Go Malware via HashiCorp Registry — https://thehackernews.com/2026/09/attackers-use-malicious-terraform.html
+> [9] Compromised MemTensor Packages Deliver sckit Credential Stealer via npm and PyPI — https://thehackernews.com/2026/09/compromised-memtensor-packages-deliver.html
+> [12] F5 Patches Critical BIG-IP APM Zero-Day Exploited for Unauthenticated RCE on OAuth Servers — https://thehackernews.com/2026/09/f5-patches-critical-big-ip-apm-zero-day.html
+> [13] Chinese Hackers Exploit Chrome-Windows Zero-Day Chain to Deploy CLEANGULP Malware — https://thehackernews.com/2026/09/chinese-hackers-exploit-chrome-windows.html
