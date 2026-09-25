@@ -7686,3 +7686,160 @@ DeviceProcessEvents
 > [9] Compromised MemTensor Packages Deliver sckit Credential Stealer via npm and PyPI — https://thehackernews.com/2026/09/compromised-memtensor-packages-deliver.html
 > [12] F5 Patches Critical BIG-IP APM Zero-Day Exploited for Unauthenticated RCE on OAuth Servers — https://thehackernews.com/2026/09/f5-patches-critical-big-ip-apm-zero-day.html
 > [13] Chinese Hackers Exploit Chrome-Windows Zero-Day Chain to Deploy CLEANGULP Malware — https://thehackernews.com/2026/09/chinese-hackers-exploit-chrome-windows.html
+
+### 2026-09-25
+
+*Generated 2026-09-25 13:27 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Ransomware affiliate (Storm-2570) post-compromise defense evasion — security tooling disabled
+- **Actor / Campaign:** Storm-2570 (Qilin / DragonForce / Anubis / BERT ransomware affiliate)
+- **MITRE ATT&CK:** T1562.001 — Impair Defenses: Disable or Modify Tools
+- **Data source:** DeviceProcessEvents, DeviceRegistryEvents
+- **Source:** [3]
+
+```kql
+// Heuristic: Storm-2570 tradecraft is described as "consistent" across ransomware deployments,
+// commonly including tampering with AV/EDR services prior to payload execution.
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where FileName in~ ("sc.exe","powershell.exe","cmd.exe","reg.exe","net.exe")
+| where ProcessCommandLine has_any (
+    "Set-MpPreference", "DisableRealtimeMonitoring", "sc stop WinDefend",
+    "sc config WinDefend", "Stop-Service", "Disable-WindowsOptionalFeature",
+    "vssadmin delete shadows", "wbadmin delete catalog")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Storm-2570's specific tool set was not fully enumerated in the source summary; this generalizes on known ransomware-affiliate defense-evasion behavior (shadow-copy/backup deletion, Defender tampering). Tune to exclude legitimate admin scripting and backup jobs.
+
+#### Ransomware affiliate lateral movement via PsExec/WMI (Storm-2570-style)
+- **Actor / Campaign:** Storm-2570
+- **MITRE ATT&CK:** T1021.002 / T1047 — Remote Services (SMB) / WMI
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where FileName in~ ("PsExec.exe","PsExec64.exe","wmic.exe")
+| where ProcessCommandLine has_any ("\\\\","-accepteula","process call create")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Ransomware affiliates repeatedly reuse PsExec/WMI for lateral movement across intrusions; validate against known IT admin usage patterns before escalation.
+
+#### macOS stealer/backdoor persistence via LaunchAgent (MacSync)
+- **Actor / Campaign:** MacSync stealer (targets crypto users/developers)
+- **MITRE ATT&CK:** T1547.001 — Boot or Logon Autostart Execution: LaunchAgent
+- **Data source:** DeviceFileEvents (Defender for Endpoint on macOS)
+- **Source:** [6]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(1d)
+| where FolderPath has_any ("/Library/LaunchAgents", "/Library/LaunchDaemons", "Library/LaunchAgents")
+| where ActionType in ("FileCreated","FileModified")
+| where FileName endswith ".plist"
+| project Timestamp, DeviceName, ActionType, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Behavioral only — no specific MacSync file/hash IOCs were published in the summary; expect noise from legitimate app installers, so pivot on recently-created plists paired with unsigned/adhoc-signed binaries.
+
+#### macOS credential/keychain access indicative of stealer activity (MacSync)
+- **Actor / Campaign:** MacSync stealer
+- **MITRE ATT&CK:** T1555.001 — Credentials from Password Stores: Keychain
+- **Data source:** DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where FileName in~ ("security","osascript")
+| where ProcessCommandLine has_any ("find-generic-password", "dump-keychain", "display dialog", "password")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* MacSync is reported to include a backdoor/stealer module targeting crypto users; `osascript` fake-password-prompt dialogs and `security` keychain dumps are common macOS stealer patterns but also used by legitimate admin scripts — tune per environment.
+
+#### ClickFix-style fake-CAPTCHA execution via Run dialog / clipboard paste
+- **Actor / Campaign:** ClickFix (commodity + state-sponsored users, per CTM360)
+- **MITRE ATT&CK:** T1204.004 / T1059.001 — User Execution: Malicious Copy-Paste; PowerShell
+- **Data source:** DeviceProcessEvents
+- **Source:** [7]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where FileName in~ ("powershell.exe","mshta.exe","cmd.exe","wscript.exe","cscript.exe")
+| where ProcessCommandLine has_any ("IEX","Invoke-Expression","DownloadString","hidden","-w hidden","-enc")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Classic ClickFix flow is browser → Win+R "Run" dialog (explorer.exe as parent) → pasted PowerShell/mshta command. No malicious domains are usable as IOCs per the report's own thesis, so this is intentionally behavioral; expect FPs from legitimate scripted admin workflows and tune out known internal tooling.
+
+#### ClickFix: browser process spawning script host directly (skipping Run dialog variant)
+- **Actor / Campaign:** ClickFix
+- **MITRE ATT&CK:** T1059.007 / T1204.004 — JavaScript/Clipboard-driven Execution
+- **Data source:** DeviceProcessEvents
+- **Source:** [7]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","firefox.exe")
+| where FileName in~ ("mshta.exe","powershell.exe","cmd.exe")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Some ClickFix variants trigger execution more directly from browser-launched helper processes; validate parent-child chain and command-line entropy/base64 usage to reduce false positives from browser-integrated PDF/print helpers.
+
+#### Post-exploitation shell spawned from Java process (possible WSO2 CVE-2026-5430 exploitation)
+- **Actor / Campaign:** unattributed (KEV-listed vulnerability, active exploitation confirmed by CISA)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [5], [8]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName in~ ("java.exe","javaw.exe","wso2server.exe")
+| where FileName in~ ("cmd.exe","powershell.exe","bash","sh","whoami.exe","curl.exe","wget")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* CVE-2026-5430 enables unrestricted file upload → RCE on WSO2 API Manager/Traffic Manager/Universal Gateway (Java-based). No file/IOC details were published; this hunts for anomalous shell spawns from the Java process hosting WSO2 and should be scoped to hosts running WSO2 products, then correlate with recent file uploads.
+
+#### Post-exploitation shell spawned from PHP process (possible Adobe Commerce/Magento CVE-2026-71362 exploitation)
+- **Actor / Campaign:** unattributed (KEV-listed vulnerability, active exploitation confirmed by CISA)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [5], [9]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(1d)
+| where InitiatingProcessFileName in~ ("php.exe","php-cgi.exe","httpd.exe","w3wp.exe","nginx.exe")
+| where FileName in~ ("cmd.exe","powershell.exe","bash","sh","whoami.exe","curl.exe")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* CVE-2026-71362 is an incorrect-authorization flaw giving elevated access without interaction; combined with other bugs this can lead to admin-panel takeover and code execution. Scope to hosts running Magento/Adobe Commerce and correlate with unexpected admin logins in application logs (not covered by EDR alone).
+
+> [2] Bitget Says Suspected North Korean Hackers Stole $351.6M After Backend Compromise — https://thehackernews.com/2026/09/bitget-says-suspected-north-korean.html
+> [3] Beyond the ransomware: Tracking Storm-2570's consistent tradecraft across deployments — https://www.microsoft.com/en-us/security/blog/2026/09/24/beyond-ransomware-tracking-storm-2570-consistent-tradecraft-across-deployments/
+> [5] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/24/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [6] MacSync under the microscope: new delivery methods and a new payload — https://securelist.com/macsync-new-version/121383/
+> [7] 17,000 URLs Reveal How ClickFix Turns Trusted Websites Into Malware Traps: Report by CTM360 — https://thehackernews.com/2026/09/17000-urls-reveal-how-clickfix-turns.html
+> [8] CVE-2026-5430 — WSO2 Multiple Products Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-5430
+> [9] CVE-2026-71362 — Adobe Commerce and Magento Incorrect Authorization Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-71362
