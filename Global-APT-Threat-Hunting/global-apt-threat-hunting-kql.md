@@ -7843,3 +7843,158 @@ DeviceProcessEvents
 > [7] 17,000 URLs Reveal How ClickFix Turns Trusted Websites Into Malware Traps: Report by CTM360 — https://thehackernews.com/2026/09/17000-urls-reveal-how-clickfix-turns.html
 > [8] CVE-2026-5430 — WSO2 Multiple Products Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-5430
 > [9] CVE-2026-71362 — Adobe Commerce and Magento Incorrect Authorization Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-71362
+
+### 2026-09-26
+
+*Generated 2026-09-26 13:23 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Storm-3168 — Anomalous Service Principal Sign-in / Cloud Recon
+- **Actor / Campaign:** Storm-3168 (JADEPUFFER-linked)
+- **MITRE ATT&CK:** T1526 — Cloud Infrastructure Discovery / T1078.004 — Valid Accounts: Cloud Accounts
+- **Data source:** AADServicePrincipalSignInLogs, AuditLogs
+- **Source:** [3]
+
+```kql
+// Service principals authenticating from new/atypical locations and hitting many distinct Graph/ARM endpoints in a short window
+AADServicePrincipalSignInLogs
+| where TimeGenerated > ago(14d)
+| where ResultType == 0
+| summarize DistinctResources = dcount(ResourceDisplayName), IPs = make_set(IPAddress), Countries = make_set(tostring(LocationDetails.countryOrRegion)), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+    by ServicePrincipalId, ServicePrincipalName
+| where DistinctResources >= 5 and array_length(Countries) > 1
+| order by DistinctResources desc
+| take 100
+```
+
+*Note:* Tune the resource/country thresholds to your environment's normal service principal footprint; legitimate automation (CI/CD, SaaS integrations) can trigger this, so cross-check against a known-good service principal allowlist.
+
+#### Storm-3168 — Service Principal Credential Add Followed by Mass Resource Deletion
+- **Actor / Campaign:** Storm-3168
+- **MITRE ATT&CK:** T1098.001 — Account Manipulation: Additional Cloud Credentials / T1531 — Account Access Removal
+- **Data source:** AuditLogs, AzureActivity
+- **Source:** [3]
+
+```kql
+let CredAdds = AuditLogs
+| where TimeGenerated > ago(14d)
+| where OperationName has_any ("Add service principal credentials", "Add application", "Update application", "Certificates and secrets management")
+| project CredTime = TimeGenerated, ServicePrincipalId = tostring(TargetResources[0].id), InitiatedBy = tostring(InitiatedBy.app.displayName);
+let Deletes = AzureActivity
+| where TimeGenerated > ago(14d)
+| where OperationNameValue has "delete"
+| where CallerIpAddress != "" or Caller != ""
+| project DeleteTime = TimeGenerated, Caller, ResourceId, OperationNameValue;
+CredAdds
+| join kind=inner (Deletes) on $left.ServicePrincipalId == $right.Caller
+| where DeleteTime between (CredTime .. CredTime + 6h)
+| project CredTime, DeleteTime, ServicePrincipalId, Caller, ResourceId, OperationNameValue
+| take 100
+```
+
+*Note:* Behavioral chain-detection (credential add → deletion activity within a short window); expect FPs from legitimate DevOps rotation/cleanup jobs, validate against change-management records before escalating.
+
+#### SharePoint w3wp.exe Spawning Shell Post CVE-2026-65660 Exploitation
+- **Actor / Campaign:** unattributed (SharePoint code injection, CISA KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [7], [11]
+
+```kql
+DeviceProcessEvents
+| where TimeGenerated > ago(7d)
+| where InitiatingProcessFileName =~ "w3wp.exe"
+| where InitiatingProcessCommandLine has_any ("SharePoint", "w3wp") // narrow to SharePoint app pool if possible
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "cscript.exe", "wscript.exe", "mshta.exe", "certutil.exe")
+| project TimeGenerated, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Apply the vendor SharePoint patch/mitigation; this catches classic IIS worker-process-to-shell post-exploitation but requires tuning to your specific SharePoint app pool name to reduce noise from legitimate admin scripts.
+
+#### MikroTik RouterOS — Anomalous Unauthenticated Session/Exec Requests (CVE-2026-67279)
+- **Actor / Campaign:** unattributed (RouterOS behavioral workflow bypass, CISA KEV, chainable to CVE-2026-86060)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (forwarded RouterOS/firewall syslog)
+- **Source:** [7], [10]
+
+```kql
+// Requires RouterOS/edge device syslog forwarded to CommonSecurityLog
+CommonSecurityLog
+| where TimeGenerated > ago(7d)
+| where DeviceVendor has "Mikrotik" or DeviceProduct has "RouterOS"
+| where Message has_any ("session channel", "exec request") or Activity has_any ("ssh", "winbox")
+| summarize AttemptCount = count(), Sample = make_set(Message, 5) by SourceIP, DestinationIP, DeviceName
+| where AttemptCount > 5
+| order by AttemptCount desc
+| take 100
+```
+
+*Note:* No native Defender/Sentinel table exists for RouterOS device internals — this depends entirely on syslog forwarding configuration and message content, so field/message names must be validated against your actual RouterOS log export; prioritize patching/mitigation per CISA KEV over detection alone.
+
+#### WordPress Core — Suspicious Page-Template Local File Inclusion (CVE-2026-87902)
+- **Actor / Campaign:** unattributed (WordPress Core RFI, CISA KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1059 — Command and Scripting Interpreter
+- **Data source:** AppServiceHTTPLogs (or W3CIISLog for IIS-hosted WordPress)
+- **Source:** [8], [12]
+
+```kql
+AppServiceHTTPLogs
+| where TimeGenerated > ago(7d)
+| where CsUriQuery has_any ("page_template=", "template=") and CsUriQuery has_any ("..", "php://", "%2e%2e", "wp-content", "wp-includes")
+| project TimeGenerated, CIp, CsHost, CsUriStem, CsUriQuery, ScStatus
+| take 100
+```
+
+*Note:* Adjust table name to your web hosting telemetry (App Service vs. on-prem IIS/Apache logs); expect FPs from theme customizer plugins using similar parameter names, so correlate hits with subsequent PHP execution or new file writes.
+
+#### Suspected DPRK Crypto-Platform Credential Compromise Precursor (Bitget-style)
+- **Actor / Campaign:** Suspected North Korean actors (Bitget hot-wallet theft, unattributed cluster)
+- **MITRE ATT&CK:** T1078 — Valid Accounts / T1552 — Unsecured Credentials
+- **Data source:** SigninLogs, IdentityLogonEvents, CloudAppEvents
+- **Source:** [9]
+
+```kql
+// Heuristic: privileged/finance-role sign-in from new geography/ASN followed by high-privilege cloud app actions within a short window
+SigninLogs
+| where TimeGenerated > ago(14d)
+| where ResultType == 0
+| where AppDisplayName has_any ("wallet", "treasury", "custody", "admin") or UserPrincipalName has_any ("treasury", "ops", "finance")
+| summarize Locations = make_set(Location), IPs = make_set(IPAddress), Count = count() by UserPrincipalName, bin(TimeGenerated, 1h)
+| where array_length(Locations) > 1
+| order by Count desc
+| take 100
+```
+
+*Note:* No concrete IOCs were published for the Bitget intrusion; this is a broad, environment-specific heuristic for impossible-travel/anomalous privileged sign-ins to finance/wallet-management applications and needs significant tuning to your identity provider's app naming and baseline travel patterns.
+
+#### Kiteworks/File-Transfer Appliance — Anomalous Admin Access During Advisory Window
+- **Actor / Campaign:** unattributed (Kiteworks precautionary shutdown advisory)
+- **MITRE ATT&CK:** T1078 — Valid Accounts / T1190 — Exploit Public-Facing Application
+- **Data source:** SigninLogs, DeviceNetworkEvents (or appliance access logs if ingested)
+- **Source:** [1], [2]
+
+```kql
+// Watch for administrative logons/network access to managed file-transfer (Kiteworks) hosts outside normal business hours,
+// particularly around vendor-declared maintenance/shutdown windows.
+DeviceNetworkEvents
+| where TimeGenerated > ago(3d)
+| where RemotePort in (443, 8443) // adjust to Kiteworks appliance mgmt ports
+| where DeviceName has "kiteworks" or RemoteUrl has "kiteworks" // adjust to your asset naming
+| summarize ConnectionCount = count(), RemoteIPs = make_set(RemoteIP) by DeviceName, bin(TimeGenerated, 1h)
+| order by ConnectionCount desc
+| take 100
+```
+
+*Note:* No technical IOCs or exploited-vulnerability detail were published at the time of this advisory — this is a purely behavioral placeholder to monitor Kiteworks/managed-file-transfer appliances for unusual admin or network activity; replace hostname/port filters with your actual asset inventory and prioritize following vendor guidance (including the recommended shutdown window) over detection engineering until more details emerge.
+
+> [1] Kiteworks Urges Customers to Shut Down Systems for 9 Hours Over Possible Cyber Attack — https://thehackernews.com/2026/09/kiteworks-urges-customers-to-shut-down.html
+> [2] Kiteworks urges 6-hour server shutdown over potential zero-day attacks — https://www.bleepingcomputer.com/news/security/kiteworks-urges-6-hour-server-shutdown-over-potential-zero-day-attacks/
+> [3] Storm-3168: Agentic-driven cloud attacks using compromised service principals — https://www.microsoft.com/en-us/security/blog/2026/09/25/storm-3168-agentic-driven-cloud-attacks-using-compromised-service-principals/
+> [7] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/25/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [8] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/25/cisa-adds-one-known-exploited-vulnerability-catalog
+> [9] Bitget Says Suspected North Korean Hackers Stole $351.6M After Backend Compromise — https://thehackernews.com/2026/09/bitget-says-suspected-north-korean.html
+> [10] CVE-2026-67279 — MikroTik RouterOS: Improper Enforcement of Behavioral Workflow Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-67279
+> [11] CVE-2026-65660 — Microsoft SharePoint: Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-65660
+> [12] CVE-2026-87902 — WordPress Core: Remote File Inclusion Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-87902
