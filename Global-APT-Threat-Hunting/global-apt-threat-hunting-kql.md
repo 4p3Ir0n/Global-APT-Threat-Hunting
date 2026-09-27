@@ -7998,3 +7998,167 @@ DeviceNetworkEvents
 > [10] CVE-2026-67279 — MikroTik RouterOS: Improper Enforcement of Behavioral Workflow Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-67279
 > [11] CVE-2026-65660 — Microsoft SharePoint: Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-65660
 > [12] CVE-2026-87902 — WordPress Core: Remote File Inclusion Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-87902
+
+### 2026-09-27
+
+*Generated 2026-09-27 13:24 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### PeopleSoft Web Process Spawning Command Shell (Possible Webshell Execution)
+- **Actor / Campaign:** ShinyHunters (CVE-2026-35273 exploitation)
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceProcessEvents
+- **Source:** [2][4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("java.exe", "tnslsnr.exe", "psappsrv.exe", "w3wp.exe", "httpd.exe")
+| where FileName in~ ("cmd.exe", "powershell.exe", "whoami.exe", "net.exe", "nslookup.exe", "certutil.exe")
+| where InitiatingProcessCommandLine has_any ("psft", "peoplesoft", "PSIGW", "integrationgateway")
+    or InitiatingProcessFolderPath has_any ("psft", "peoplesoft", "PSIGW")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* PeopleSoft/Tomcat processes rarely spawn shells; any hit should be treated as high-priority triage. Tune process/folder name filters to your actual PeopleSoft deployment paths.
+
+#### Web Shell File Dropped in PeopleSoft Application Directories
+- **Actor / Campaign:** ShinyHunters (CVE-2026-35273 exploitation)
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceFileEvents
+- **Source:** [2][4]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any ("PSIGW", "psreports", "peoplesoft", "webserv")
+| where FileName endswith ".jsp" or FileName endswith ".jspx" or FileName endswith ".war"
+| where ActionType in ("FileCreated", "FileModified")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* Legitimate PeopleSoft patches/deployments can drop .jsp/.war files; correlate timing with recent exploitation reports and check for unusual naming or obfuscated content.
+
+#### Suspicious Double URL-Encoding / WAF Bypass Pattern in Web Requests
+- **Actor / Campaign:** ShinyHunters (WAF bypass for CVE-2026-35273)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (WAF/reverse-proxy syslog ingestion)
+- **Source:** [2][4]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where RequestURL has_any ("%25", "..%2f", "..%252f", "%2e%2e")
+| where RequestURL has_any ("psp", "psc", "peoplesoft", "signon")
+| summarize RequestCount = count(), SampleURLs = make_set(RequestURL, 5) by SourceIP, DestinationIP, DeviceVendor
+| where RequestCount > 3
+| take 100
+```
+
+*Note:* This is heuristic — depends on your WAF/proxy log schema (adjust field names for your CommonSecurityLog parser). Double-encoding is a generic bypass technique, so validate hits against actual PeopleSoft endpoints before escalating.
+
+#### Anomalous Requests to NetScaler Gateway / Management Endpoints
+- **Actor / Campaign:** Unattributed (Citrix NetScaler zero-day exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (Citrix NetScaler syslog/WAF logs)
+- **Source:** [1]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(3d)
+| where DeviceVendor has "Citrix" or Message has_any ("NetScaler", "nsconfig", "/vpn/", "/nitro/v1")
+| where RequestMethod in ("POST", "PUT") and isnotempty(RequestURL)
+| where RequestURL has_any ("/vpn/", "/nitro/", "/logon/", "/oauth/")
+| summarize RequestCount = count(), Methods = make_set(RequestMethod), URLs = make_set(RequestURL, 10) by SourceIP, DestinationIP
+| where RequestCount > 20
+| take 100
+```
+
+*Note:* No confirmed IOCs exist yet for these zero-days [1]; this is a coarse volumetric/behavioral hunt for exploitation attempts against Gateway/NITRO API endpoints — expect tuning per your NetScaler syslog schema, and prioritize correlating with Citrix advisories once published.
+
+#### ClickFix-Style Fake CAPTCHA Leading to PowerShell/MSHTA Execution
+- **Actor / Campaign:** Lunex MaaS (Psychedelic/Lunex Stealer)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste; T1059.001 — PowerShell
+- **Data source:** DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where FileName in~ ("powershell.exe", "mshta.exe", "cmd.exe", "wscript.exe", "cscript.exe")
+| where ProcessCommandLine has_any ("IEX", "DownloadString", "-enc", "-w hidden", "hta:", "javascript:")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* ClickFix attacks trick users into pasting malicious commands via Win+R; this looks for the resulting explorer.exe → script-host chain. Expect noise from legitimate admin scripting — narrow to endpoints with recent browsing to non-corporate/Ukrainian-language sites if web proxy telemetry is available.
+
+#### Vulnerable/Signed AMD Driver Load Followed by Security Process Termination (BYOVD)
+- **Actor / Campaign:** Lunex Stealer
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation; T1562.001 — Impair Defenses: Disable or Modify Tools
+- **Data source:** DeviceImageLoadEvents, DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+let driverLoads = DeviceImageLoadEvents
+| where Timestamp > ago(14d)
+| where FileName has "amd" and FileName endswith ".sys"
+| project Timestamp, DeviceName, FileName, FolderPath, SHA256;
+let killAttempts = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("taskkill.exe", "sc.exe", "net.exe")
+| where ProcessCommandLine has_any ("MsMpEng", "SenseIR", "Sense", "WdFilter", "defender", "antivirus")
+| project Timestamp, DeviceName, ProcessCommandLine;
+driverLoads
+| join kind=inner (killAttempts) on DeviceName
+| where (Timestamp1 - Timestamp) between (0min .. 15min)
+| project DeviceName, DriverLoadTime = Timestamp, DriverFile = FileName, KillTime = Timestamp1, ProcessCommandLine
+| take 100
+```
+
+*Note:* Legitimate AMD chipset/GPU driver installs will trigger the first half; the correlation with near-simultaneous defender-kill commands is the key discriminator — validate driver hash/signature against known-vulnerable AMD driver CVEs before alerting.
+
+#### Browser Credential Store Access by Non-Browser Process
+- **Actor / Campaign:** Lunex / Psychedelic Stealer
+- **MITRE ATT&CK:** T1555.003 — Credentials from Web Browsers
+- **Data source:** DeviceFileEvents
+- **Source:** [3]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any (@"\Google\Chrome\User Data", @"\Microsoft\Edge\User Data", @"\Mozilla\Firefox\Profiles")
+| where FileName in~ ("Login Data", "cookies.sqlite", "key4.db", "Cookies")
+| where InitiatingProcessFileName !in~ ("chrome.exe", "msedge.exe", "firefox.exe", "explorer.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FolderPath, FileName
+| take 100
+```
+
+*Note:* Backup/EDR/AV agents may legitimately touch these paths — allow-list known security tools and correlate with the process chains from the ClickFix and BYOVD detections above for higher confidence.
+
+#### Anomalous Authentication to Secure File Transfer / Kiteworks Appliance
+- **Actor / Campaign:** Unattributed (threat targeting Kiteworks/Accellion systems)
+- **MITRE ATT&CK:** T1078 — Valid Accounts; T1190 — Exploit Public-Facing Application
+- **Data source:** SigninLogs, CommonSecurityLog
+- **Source:** [5]
+
+```kql
+SigninLogs
+| where TimeGenerated > ago(3d)
+| where AppDisplayName has_any ("Kiteworks", "Accellion", "FileTransfer")
+| summarize FailedCount = countif(ResultType != "0"), SuccessCount = countif(ResultType == "0"), IPs = make_set(IPAddress, 10) by UserPrincipalName, bin(TimeGenerated, 1h)
+| where FailedCount > 5 and SuccessCount > 0
+| take 100
+```
+
+*Note:* No specific TTPs or IOCs were disclosed for the Kiteworks threat [5]; this is a generic anomalous-auth hunt for the affected appliance class and should be paired with vendor guidance/patches as they emerge.
+
+> [1] Warning: Two Unpatched Citrix NetScaler RCE Zero-Days Under Active Exploitation — https://thehackernews.com/2026/09/warning-two-unpatched-citrix-netscaler.html
+> [2] ShinyHunters uses WAF bypass trick in Oracle PeopleSoft attacks — https://www.bleepingcomputer.com/news/security/shinyhunters-uses-waf-bypass-trick-in-oracle-peoplesoft-attacks/
+> [3] Lunex Stealer Abuses AMD Driver to Disable Security Monitoring and Steal Browser Credentials — https://thehackernews.com/2026/09/lunex-stealer-abuses-amd-driver-to.html
+> [4] Attackers Bypass WAFs to Exploit Oracle PeopleSoft Flaw and Deploy Web Shells — https://thehackernews.com/2026/09/attackers-bypass-wafs-to-exploit-oracle.html
+> [5] Kiteworks Urges Customers to Shut Down Systems for 9 Hours Over Possible Cyber Attack — https://thehackernews.com/2026/09/kiteworks-urges-customers-to-shut-down.html
