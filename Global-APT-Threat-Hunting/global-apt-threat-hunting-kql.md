@@ -8162,3 +8162,172 @@ SigninLogs
 > [3] Lunex Stealer Abuses AMD Driver to Disable Security Monitoring and Steal Browser Credentials — https://thehackernews.com/2026/09/lunex-stealer-abuses-amd-driver-to.html
 > [4] Attackers Bypass WAFs to Exploit Oracle PeopleSoft Flaw and Deploy Web Shells — https://thehackernews.com/2026/09/attackers-bypass-wafs-to-exploit-oracle.html
 > [5] Kiteworks Urges Customers to Shut Down Systems for 9 Hours Over Possible Cyber Attack — https://thehackernews.com/2026/09/kiteworks-urges-customers-to-shut-down.html
+
+### 2026-09-28
+
+*Generated 2026-09-28 13:32 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Docker Daemon Exposed with Unauthenticated Remote API (Carbonato precursor)
+- **Actor / Campaign:** Carbonato botnet
+- **MITRE ATT&CK:** T1610 — Deploy Container / T1133 — External Remote Services
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// Detects dockerd (or docker daemon config) being started with an exposed TCP socket,
+// which is the entry point Carbonato abuses to reach Docker hosts.
+DeviceProcessEvents
+| where TimeGenerated > ago(2d)
+| where FileName in~ ("dockerd", "docker", "containerd")
+| where ProcessCommandLine has "-H tcp://"
+    or ProcessCommandLine has "0.0.0.0:2375"
+    or ProcessCommandLine has "0.0.0.0:2376"
+| project TimeGenerated, DeviceName, FileName, ProcessCommandLine, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* Flags misconfiguration rather than active compromise; combine with external firewall/exposure data (e.g., Shodan-style asset inventory) to confirm the daemon is internet-reachable before escalating.
+
+#### Hermes Agent SOUL.md Persona File Tampering
+- **Actor / Campaign:** Carbonato botnet
+- **MITRE ATT&CK:** T1584.005 — Compromise Infrastructure: Botnet / T1105 — Ingress Tool Transfer
+- **Data source:** DeviceFileEvents
+- **Source:** [1]
+
+```kql
+// Carbonato deploys the unmodified Hermes Agent framework and then overwrites its
+// SOUL.md persona file with a malicious 39-line prompt to redirect agent behavior.
+DeviceFileEvents
+| where TimeGenerated > ago(2d)
+| where FileName =~ "SOUL.md"
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| project TimeGenerated, DeviceName, FolderPath, FileName, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* SOUL.md is a specific artifact named in the report for the Hermes Agent framework; legitimate developer use of Hermes Agent will also trigger this, so pivot on container/host context (freshly deployed Docker container, unexpected account) before treating as malicious.
+
+#### Container Process Communicating with Telegram C2 Infrastructure
+- **Actor / Campaign:** Carbonato botnet
+- **MITRE ATT&CK:** T1071.001 — Application Layer Protocol: Web Protocols (Telegram C2)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// Hermes Agent is remotely tasked over Telegram; look for containerized/host processes
+// reaching Telegram's bot API from servers that should not normally use Telegram.
+DeviceNetworkEvents
+| where TimeGenerated > ago(2d)
+| where RemoteUrl has "api.telegram.org" or RemoteUrl has "t.me"
+| where InitiatingProcessParentFileName in~ ("dockerd", "containerd-shim", "runc", "containerd")
+    or InitiatingProcessFolderPath has "/var/lib/docker/"
+| project TimeGenerated, DeviceName, InitiatingProcessFileName, InitiatingProcessParentFileName, RemoteUrl, RemoteIP
+| take 100
+```
+
+*Note:* Behavioral/heuristic — legitimate Telegram bot integrations on servers will also match; scope to hosts running Docker/container workloads without a documented business need for Telegram.
+
+#### Mass Azure Resource Deletion by a Single Principal (JADEPUFFER-style Destructive Activity)
+- **Actor / Campaign:** JADEPUFFER (Storm-3168)
+- **MITRE ATT&CK:** T1531 — Account Access Removal / T1485 — Data Destruction
+- **Data source:** AzureActivity
+- **Source:** [2]
+
+```kql
+// Storm-3168 used a compromised service principal to perform destructive operations
+// (mass resource deletion) over ~18 hours; hunt for high-volume delete bursts.
+AzureActivity
+| where TimeGenerated > ago(2d)
+| where OperationNameValue has "delete"
+| where ActivityStatusValue =~ "Success"
+| summarize DeleteCount = count(),
+            Resources = make_set(ResourceId, 25),
+            ResourceGroups = make_set(ResourceGroup, 10)
+          by Caller, CallerIpAddress, bin(TimeGenerated, 1h)
+| where DeleteCount > 15
+| sort by DeleteCount desc
+| take 100
+```
+
+*Note:* Tune the DeleteCount threshold to your environment's normal IaC/automation churn (e.g., CI/CD pipelines); correlate `Caller` against known service principal object IDs and flag any that are not tied to expected automation.
+
+#### Anomalous Service Principal Sign-In Activity Preceding Destructive Actions
+- **Actor / Campaign:** JADEPUFFER (Storm-3168)
+- **MITRE ATT&CK:** T1078.004 — Valid Accounts: Cloud Accounts / T1550.001 — Use Alternate Authentication Material
+- **Data source:** AADServicePrincipalSignInLogs, AzureActivity
+- **Source:** [2]
+
+```kql
+// Look for a service principal authenticating from new/rare IPs shortly before
+// it is used to perform destructive Azure resource operations.
+let SuspiciousSPs =
+    AADServicePrincipalSignInLogs
+    | where TimeGenerated > ago(3d)
+    | summarize IPCount = dcount(IPAddress), IPs = make_set(IPAddress, 5) by ServicePrincipalId, ServicePrincipalName
+    | where IPCount >= 2;
+AzureActivity
+| where TimeGenerated > ago(3d)
+| where OperationNameValue has "delete"
+| extend ServicePrincipalId = Caller
+| join kind=inner SuspiciousSPs on ServicePrincipalId
+| project TimeGenerated, ServicePrincipalName, ServicePrincipalId, IPs, ResourceGroup, OperationNameValue
+| take 100
+```
+
+*Note:* Heuristic correlation query — requires the Entra ID sign-in log table name/schema in your tenant to be verified (`AADServicePrincipalSignInLogs` vs. `SigninLogs` with `ServicePrincipalId` populated); tune IP-count threshold to reduce noise from legitimate multi-region automation.
+
+#### Suspected NetScaler Post-Exploitation: Appliance-Originated Anomalous Outbound Connections
+- **Actor / Campaign:** unattributed (mass exploitation of CVE-2026-88771 / CVE-2026-88772)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1071 — Application Layer Protocol (C2)
+- **Data source:** CommonSecurityLog (Citrix/NetScaler syslog forwarding), AzureFirewall/NSG flow logs
+- **Source:** [4] [6] [7] [8] [9] [10]
+
+```kql
+// NetScaler ADC/Gateway appliances rarely initiate outbound sessions on their own.
+// After exploitation of CVE-2026-88771/88772 an RCE could spawn reverse shells or
+// outbound C2 traffic from the appliance itself. Requires a watchlist of known
+// NetScaler appliance IPs in your environment.
+let NetScalerAppliances = (_GetWatchlist('NetScalerAppliances') | project SearchKey);
+CommonSecurityLog
+| where TimeGenerated > ago(2d)
+| where SourceIP in (NetScalerAppliances)
+| where DestinationPort !in (443, 80, 53)
+| summarize ConnCount = count(), Destinations = make_set(DestinationIP, 10) by SourceIP, bin(TimeGenerated, 1h)
+| where ConnCount > 3
+| take 100
+```
+
+*Note:* Requires a `NetScalerAppliances` watchlist populated with your appliance management/production IPs and confirmed syslog ingestion (CEF/Syslog connector); this is a generic anomaly heuristic since no specific post-exploit IOCs were published for these CVEs — validate any hit before declaring compromise, and check Citrix's own NetScaler Console IOC data per [6].
+
+#### Spike in Requests to Internet-Facing NetScaler Management/Gateway Interfaces
+- **Actor / Campaign:** unattributed (CVE-2026-88771 / CVE-2026-88772 mass scanning/exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog, DeviceNetworkEvents (perimeter/WAF logs)
+- **Source:** [4] [6] [7] [8] [9] [10]
+
+```kql
+// Detect volumetric spikes of inbound HTTP(S) requests to known NetScaler
+// appliance IPs from external sources — consistent with mass internet-wide
+// scanning/exploitation activity reported for CVE-2026-88771/88772.
+let NetScalerAppliances = (_GetWatchlist('NetScalerAppliances') | project SearchKey);
+CommonSecurityLog
+| where TimeGenerated > ago(2d)
+| where DestinationIP in (NetScalerAppliances)
+| where DestinationPort in (443, 80)
+| summarize RequestCount = count(), UniqueSrcIPs = dcount(SourceIP) by DestinationIP, bin(TimeGenerated, 15m)
+| where RequestCount > 200 or UniqueSrcIPs > 20
+| take 100
+```
+
+*Note:* No specific exploit request path/pattern was disclosed in these sources; this is a volumetric/anomaly heuristic to catch pre-patch scanning bursts. If your WAF/NetScaler exposes URI paths in CommonSecurityLog `RequestURL`, add filtering on management endpoints (e.g., `/nsconfig`, `/vpn/`) for higher precision, and cross-reference hits against Citrix's published IOC feed via NetScaler Console [6].
+
+> [1] Carbonato Botnet Compromises Docker Hosts to Deploy Telegram-Controlled Hermes AI Agent — https://thehackernews.com/2026/09/carbonato-botnet-compromises-docker.html
+> [2] JADEPUFFER-Linked Attackers Used Compromised Service Principals to Delete Azure Resources — https://thehackernews.com/2026/09/jadepuffer-linked-attackers-used.html
+> [4] Citrix confirms two NetScaler RCE zero-days exploited in attacks — https://www.bleepingcomputer.com/news/security/citrix-admins-warned-to-shut-down-netscalers-over-2-exploited-zero-days/
+> [6] Critical Zero-Day Vulnerabilities Exploited in Citrix NetScaler ADC, Gateway — https://www.cisa.gov/news-events/alerts/2026/09/27/critical-zero-day-vulnerabilities-exploited-citrix-netscaler-adc-gateway
+> [7] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/27/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [8] Warning: Two Unpatched Citrix NetScaler RCE Zero-Days Under Active Exploitation — https://thehackernews.com/2026/09/warning-two-unpatched-citrix-netscaler.html
+> [9] CVE-2026-88772 — Citrix NetScaler — https://nvd.nist.gov/vuln/detail/CVE-2026-88772
+> [10] CVE-2026-88771 — Citrix NetScaler — https://nvd.nist.gov/vuln/detail/CVE-2026-88771
