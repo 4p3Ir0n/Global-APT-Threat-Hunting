@@ -8331,3 +8331,182 @@ CommonSecurityLog
 > [8] Warning: Two Unpatched Citrix NetScaler RCE Zero-Days Under Active Exploitation — https://thehackernews.com/2026/09/warning-two-unpatched-citrix-netscaler.html
 > [9] CVE-2026-88772 — Citrix NetScaler — https://nvd.nist.gov/vuln/detail/CVE-2026-88772
 > [10] CVE-2026-88771 — Citrix NetScaler — https://nvd.nist.gov/vuln/detail/CVE-2026-88771
+
+### 2026-09-29
+
+*Generated 2026-09-29 13:33 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### NeedyMantis-style post-compromise loader activity
+- **Actor / Campaign:** NeedyMantis (Microsoft-tracked post-compromise framework)
+- **MITRE ATT&CK:** T1105 — Ingress Tool Transfer / T1027.002 — Software Packing (encrypted archives)
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [6][8]
+
+```kql
+// Heuristic: NeedyMantis reporting describes custom loaders that unpack encrypted archives to disk
+// and drop extensible follow-on components. Hunt for processes writing password-protected/encrypted
+// archive containers followed by execution of a newly-dropped binary from the same folder.
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName endswith ".7z" or FileName endswith ".zip" or FileName endswith ".rar" or FileName endswith ".dat"
+| where FolderPath has_any (@"\AppData\", @"\ProgramData\", @"\Public\", @"\Temp\")
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessFileName, InitiatingProcessCommandLine, SHA256
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where InitiatingProcessFileName in~ ("cmd.exe","powershell.exe","rundll32.exe","mshta.exe")
+    | project Timestamp2 = Timestamp, DeviceName, ProcFileName = FileName, ProcCmdLine = ProcessCommandLine, ProcFolder = FolderPath
+) on DeviceName
+| where Timestamp2 between (Timestamp .. (Timestamp + 10m))
+| take 100
+```
+
+*Note:* No concrete file names/hashes were published; this is purely behavioral (archive drop + near-immediate execution) and will need tuning per environment (software installers/updaters can trigger similar patterns).
+
+#### Suspicious sideloaded module load consistent with modular loader frameworks
+- **Actor / Campaign:** NeedyMantis
+- **MITRE ATT&CK:** T1574.002 — DLL Side-Loading
+- **Data source:** DeviceImageLoadEvents, DeviceProcessEvents
+- **Source:** [6][8]
+
+```kql
+// NeedyMantis is described as modular/extensible with custom loaders — hunt for signed
+// legitimate binaries loading unsigned DLLs from unusual (user-writable) paths.
+DeviceImageLoadEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any (@"\AppData\Local\", @"\AppData\Roaming\", @"\Users\Public\", @"\ProgramData\")
+| where InitiatingProcessSignatureStatus == "Valid" or InitiatingProcessSignatureStatus == "Signed"
+| where isnotempty(InitiatingProcessFileName)
+| summarize ModuleCount = dcount(FileName), Modules = make_set(FileName, 10) by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+| where ModuleCount >= 1
+| take 100
+```
+
+*Note:* High-volume heuristic; best used to pivot on hosts already flagged by other alerts (targeted sectors per report: telecom, universities, medical nonprofits, IGOs, gov contractors) rather than run standalone.
+
+#### NetScaler zero-day exploitation follow-up activity (CVE-2026-88771 / CVE-2026-88772)
+- **Actor / Campaign:** unattributed (mass exploitation of Citrix NetScaler)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog, DeviceNetworkEvents
+- **Source:** [7]
+
+```kql
+// No IOCs published yet; hunt for anomalous inbound traffic to NetScaler Gateway/ADC
+// management interfaces followed by outbound connections from the appliance shortly after.
+CommonSecurityLog
+| where TimeGenerated > ago(3d)
+| where DeviceVendor has "Citrix" or Activity has_any ("NetScaler","ADC","Gateway")
+| where isnotempty(DestinationIP)
+| summarize RequestCount = count(), Sources = make_set(SourceIP, 20) by DestinationIP, bin(TimeGenerated, 1h)
+| where RequestCount > 200
+| take 100
+```
+
+*Note:* Placeholder/behavioral only — Unit 42's brief does not yet include exploitation artifacts or C2 indicators; replace with vendor IOC feed / official Citrix advisory indicators once released, and validate against your NetScaler log source schema (may differ from CommonSecurityLog).
+
+#### Carbonato botnet — Docker daemon abuse and Hermes Agent persona overwrite
+- **Actor / Campaign:** Carbonato botnet
+- **MITRE ATT&CK:** T1610 — Deploy Container / T1219 — Remote Access Software / T1071.001 — Web Protocols (Telegram C2)
+- **Data source:** DeviceProcessEvents, DeviceFileEvents, DeviceNetworkEvents
+- **Source:** [9]
+
+```kql
+// Carbonato targets exposed Docker daemons and deploys the open-source Hermes Agent,
+// then overwrites its SOUL.md persona file to redirect instructions via Telegram.
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "SOUL.md"
+| where ActionType in ("FileCreated","FileModified")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessCommandLine
+| take 100
+```
+
+```kql
+// Companion query: Docker host processes reaching out to Telegram API infrastructure (C2 channel)
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has "api.telegram.org" or RemoteUrl has "t.me"
+| where InitiatingProcessFileName has_any ("dockerd","docker","containerd","runc")
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteUrl, RemoteIP, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* SOUL.md is specific to the Hermes Agent framework named in the report and is a strong, low-FP indicator if present on non-AI-agent hosts; the Telegram network query is broader and needs allow-listing for legitimate Telegram usage.
+
+#### Mass Azure resource deletion via compromised service principal (Storm-3168 / JADEPUFFER pattern)
+- **Actor / Campaign:** JADEPUFFER (Microsoft: Storm-3168)
+- **MITRE ATT&CK:** T1485 — Data Destruction / T1078.004 — Valid Accounts: Cloud Accounts
+- **Data source:** AzureActivity
+- **Source:** [10]
+
+```kql
+// JADEPUFFER used compromised service principals to perform rapid, high-volume destructive
+// operations (resource deletion) over ~18 hours. Hunt for a single SPN performing many
+// delete operations across resource groups/subscriptions in a short window.
+AzureActivity
+| where TimeGenerated > ago(30d)
+| where OperationNameValue has "delete"
+| where CallerIpAddress != "" 
+| extend Caller = tostring(Caller)
+| summarize DeleteCount = count(), Resources = make_set(ResourceId, 50), IPs = make_set(CallerIpAddress) by Caller, bin(TimeGenerated, 1h)
+| where DeleteCount >= 10
+| sort by DeleteCount desc
+| take 100
+```
+
+*Note:* Tune the delete-count threshold and time bin to your normal IaC/CI-CD teardown activity; correlate with recent app-registration / service-principal credential changes (AuditLogs) to reduce false positives from legitimate automation.
+
+#### Newly added or modified service principal credentials followed by destructive activity
+- **Actor / Campaign:** JADEPUFFER / Storm-3168
+- **MITRE ATT&CK:** T1098.001 — Account Manipulation: Additional Cloud Credentials
+- **Data source:** AuditLogs, AzureActivity
+- **Source:** [10]
+
+```kql
+// Look for a service principal credential add/update event followed within hours by
+// a burst of delete operations by the same principal — matching the reported ~18hr window.
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where OperationName has_any ("Add service principal credentials","Update application – Certificates and secrets management")
+| project CredTime = TimeGenerated, ServicePrincipalId = tostring(TargetResources[0].id), InitiatedBy = tostring(InitiatedBy.app.displayName)
+| join kind=inner (
+    AzureActivity
+    | where OperationNameValue has "delete"
+    | project DelTime = TimeGenerated, Caller, ResourceId
+) on $left.ServicePrincipalId == $right.Caller
+| where DelTime between (CredTime .. (CredTime + 24h))
+| take 100
+```
+
+*Note:* Field mapping between AuditLogs TargetResources and AzureActivity Caller may need adjustment per tenant schema; this is a correlation heuristic, not a guaranteed match on identifiers.
+
+#### Devices vulnerable to exploited CoreGraphics zero-day (CVE-2026-86950)
+- **Actor / Campaign:** unattributed (targeted iOS/macOS attacks)
+- **MITRE ATT&CK:** T1203 — Exploitation for Client Execution
+- **Data source:** DeviceTvmSoftwareInventory
+- **Source:** [2][4][5]
+
+```kql
+// Inventory-based hunt: identify unpatched iOS/iPadOS/macOS endpoints vulnerable to the
+// actively-exploited CoreGraphics out-of-bounds write (CVE-2026-86950), older branches only
+// per Apple advisory (iOS/macOS 27 branch not affected).
+DeviceTvmSoftwareInventory
+| where OSPlatform in ("iOS","iPadOS","macOS")
+| where SoftwareVendor =~ "apple"
+| where OSVersion !startswith "27"
+| project DeviceId, DeviceName, OSPlatform, OSVersion
+| take 100
+```
+
+*Note:* This is an exposure/patch-compliance query, not an attack detection — pair with MDE vulnerability management CVE tagging (once CVE-2026-86950 is indexed) to confirm coverage; endpoint telemetry alone cannot detect exploitation of this memory-corruption bug.
+
+> [2] Apple patches CoreGraphics zero-day flaw exploited in attacks — https://www.bleepingcomputer.com/news/security/apple-patches-coregraphics-zero-day-flaw-exploited-in-attacks/
+> [4] Apple Emergency Patch for iOS 26, macOS26, macOS15 (CVE-2026-86950) — https://isc.sans.edu/diary/rss/33376
+> [5] Apple Patches CoreGraphics Flaw Possibly Exploited in Targeted Attacks — https://thehackernews.com/2026/09/apple-patches-coregraphics-flaw.html
+> [6] Hackers Use NeedyMantis to Maintain Long-Term Access in Breached Networks — https://thehackernews.com/2026/09/hackers-use-needymantis-to-maintain.html
+> [7] Threat Brief: NetScaler Zero Days CVE-2026-88771 and CVE-2026-88772 Exploited in the Wild — https://unit42.paloaltonetworks.com/netscaler-zero-days-exploited/
+> [8] NeedyMantis: Unpacking a post-compromise malware family used in targeted operations — https://www.microsoft.com/en-us/security/blog/2026/09/28/needymantis-unpacking-a-post-compromise-malware-family-used-in-targeted-operations/
+> [9] Carbonato Botnet Compromises Docker Hosts to Deploy Telegram-Controlled Hermes AI Agent — https://thehackernews.com/2026/09/carbonato-botnet-compromises-docker.html
+> [10] JADEPUFFER-Linked Attackers Used Compromised Service Principals to Delete Azure Resources — https://thehackernews.com/2026/09/jadepuffer-linked-attackers-used.html
