@@ -8510,3 +8510,179 @@ DeviceTvmSoftwareInventory
 > [8] NeedyMantis: Unpacking a post-compromise malware family used in targeted operations — https://www.microsoft.com/en-us/security/blog/2026/09/28/needymantis-unpacking-a-post-compromise-malware-family-used-in-targeted-operations/
 > [9] Carbonato Botnet Compromises Docker Hosts to Deploy Telegram-Controlled Hermes AI Agent — https://thehackernews.com/2026/09/carbonato-botnet-compromises-docker.html
 > [10] JADEPUFFER-Linked Attackers Used Compromised Service Principals to Delete Azure Resources — https://thehackernews.com/2026/09/jadepuffer-linked-attackers-used.html
+
+### 2026-09-30
+
+*Generated 2026-09-30 13:31 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — query 8: placeholder-like token 'placeholder'. All queries are CANDIDATES; validate before use._
+
+#### NetScaler CVE-2026-88772 exploitation — webshell / tunneling activity (WHIPSHOT/SLAPSHOT)
+- **Actor / Campaign:** Unattributed (tracked by Mandiant/GTIG)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1505.003 — Web Shell
+- **Data source:** CommonSecurityLog (Citrix NetScaler syslog/CEF), DeviceNetworkEvents
+- **Source:** [3][4]
+
+```kql
+// Hunt for suspicious HTTP activity against NetScaler management/VPN endpoints indicative of
+// post-exploitation webshell drop or tunneling (WHIPSHOT/SLAPSHOT) following CVE-2026-88772
+CommonSecurityLog
+| where DeviceVendor has "Citrix" or DeviceProduct has_any ("NetScaler", "ADC", "Gateway")
+| where TimeGenerated > ago(14d)
+| where RequestURL has_any ("/vpn/", "/logon/", "/nf/", ".php", ".pl", "/../")
+      or Activity has_any ("config write", "unauthorized", "root")
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, RequestURL, Activity, Message
+| take 100
+```
+
+*Note:* No public file names/hashes for WHIPSHOT/SLAPSHOT are yet available; this is a coarse pattern on log fields that vary by syslog integration — tune `RequestURL`/`Activity` filters to your actual NetScaler CEF schema and validate against a baseline of normal admin traffic.
+
+#### Post-compromise logons sourced from NetScaler appliance IP ranges
+- **Actor / Campaign:** Unattributed (NetScaler CVE-2026-88772 intrusion set)
+- **MITRE ATT&CK:** T1078 — Valid Accounts; T1210 — Exploitation of Remote Services
+- **Data source:** IdentityLogonEvents, DeviceLogonEvents
+- **Source:** [3][4]
+
+```kql
+// Look for authentications immediately following exploitation, originating from
+// the NetScaler appliance's internal/management IP address(es) — populate NetScalerIPs
+// with your organization's known appliance addresses.
+let NetScalerIPs = dynamic([]); // <-- fill with internal mgmt/DMZ IPs of your NetScaler ADC
+IdentityLogonEvents
+| where Timestamp > ago(14d)
+| where IPAddress in (NetScalerIPs)
+| where ActionType in ("LogonSuccess")
+| summarize LogonCount = count(), Accounts = make_set(AccountName) by IPAddress, bin(Timestamp, 1h)
+| where LogonCount > 5
+| take 100
+```
+
+*Note:* Requires customer-specific IP enrichment of the NetScaler appliance; high false-positive rate if the appliance is a legitimate SSO/AAA relay — validate against baseline logon volume.
+
+#### Star Blizzard fake event-invite phishing leading to backdoor install
+- **Actor / Campaign:** Star Blizzard (COLDRIVER, Russia-nexus)
+- **MITRE ATT&CK:** T1566.001/.002 — Phishing; T1204.002 — User Execution: Malicious File
+- **Data source:** EmailEvents, EmailAttachmentInfo, DeviceProcessEvents
+- **Source:** [5][7]
+
+```kql
+// Fake meeting/event invitation phishing, then unusual archive/LNK/HTA execution
+// consistent with Star Blizzard's RedFlick delivery evolution
+EmailEvents
+| where Timestamp > ago(14d)
+| where Subject has_any ("invite", "invitation", "meeting", "conference", "webinar", "event")
+| where SenderMailFromDomain !endswith "yourorg.com" // adjust to your accepted domains
+| join kind=inner (EmailAttachmentInfo) on NetworkMessageId
+| where FileType in ("pdf", "html", "zip", "iso", "img", "lnk", "hta")
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject, FileName, FileType
+| take 100
+```
+
+```kql
+// Follow-on: suspicious script/LNK execution shortly after a user opens a mail attachment
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("mshta.exe","wscript.exe","cscript.exe","powershell.exe")
+| where InitiatingProcessFileName in~ ("explorer.exe","outlook.exe","winword.exe","acrord32.exe")
+| where ProcessCommandLine has_any (".hta", ".lnk", "http")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* Heuristic — Star Blizzard historically customizes lure themes per target; expect tuning of subject keywords and sender allow-listing to reduce noise from legitimate calendar invites.
+
+#### RedFlick-style payload delivery via compromised legitimate websites
+- **Actor / Campaign:** Star Blizzard (RedFlick technique)
+- **MITRE ATT&CK:** T1608.004 — Stage Capabilities: Drive-by Target; T1105 — Ingress Tool Transfer
+- **Data source:** DeviceNetworkEvents, DeviceProcessEvents, DeviceFileEvents
+- **Source:** [7]
+
+```kql
+// Browser process downloading archive/container file types (ISO/IMG/VHD) shortly after
+// navigating to an external link — a pattern consistent with RedFlick delivery via
+// compromised/legitimate-looking websites
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName endswith_any (".iso", ".img", ".vhd", ".lnk")
+| where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","firefox.exe")
+| project Timestamp, DeviceName, AccountName, FileName, FolderPath, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* No specific domains/hashes published yet for RedFlick; this looks for container-file delivery patterns broadly abused by state actors for defense evasion — expect FPs from legitimate ISO/VHD use in IT workflows.
+
+#### Compromised developer identity pivoting to cloud resource access (Storm-3068 pattern)
+- **Actor / Campaign:** Storm-3068
+- **MITRE ATT&CK:** T1078.004 — Valid Accounts: Cloud Accounts; T1098.001 — Account Manipulation: Additional Cloud Credentials
+- **Data source:** SigninLogs, AuditLogs (Entra ID), CloudAppEvents
+- **Source:** [6]
+
+```kql
+// Sign-in from a source-code/CI identity followed by addition of new credentials/secrets
+// to a service principal or app registration — consistent with "source code to cloud keys" pivot
+AuditLogs
+| where TimeGenerated > ago(14d)
+| where OperationName in ("Add service principal credentials", "Add application", "Update application – Certificates and secrets management")
+| extend InitiatedBy = tostring(InitiatedBy.user.userPrincipalName)
+| join kind=inner (
+    SigninLogs
+    | where TimeGenerated > ago(14d)
+    | where AppDisplayName has_any ("DevOps","GitHub","GitLab","Pipeline")
+) on $left.InitiatedBy == $right.UserPrincipalName
+| project TimeGenerated, InitiatedBy, OperationName, AppDisplayName, IPAddress, ResultType
+| take 100
+```
+
+*Note:* Behavioral/heuristic based on the reported pattern of identity-to-cloud escalation; tune app name filters to your actual CI/CD and source-control integrations to avoid alerting on routine credential rotation.
+
+#### China-nexus UAT-11587 “Antino” backdoor — behavioral hunt (limited IOC reporting)
+- **Actor / Campaign:** UAT-11587 (China-nexus)
+- **MITRE ATT&CK:** T1574.002 — DLL Side-Loading; T1053.005 — Scheduled Task
+- **Data source:** DeviceImageLoadEvents, DeviceProcessEvents
+- **Source:** [2]
+
+```kql
+// No file names/hashes disclosed for Antino at time of writing. Generic hunt for
+// DLL side-loading via a signed host process launched from an unusual/user-writable
+// path — common loader technique for China-nexus backdoors targeting gov/policy orgs.
+DeviceImageLoadEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any (@"\Users\", @"\AppData\", @"\ProgramData\")
+| where InitiatingProcessFileName in~ ("rundll32.exe","regsvr32.exe","mshta.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, FolderPath
+| take 100
+```
+
+*Note:* Talos reporting names the backdoor "Antino" but provides no public file/network IOCs yet; treat as a speculative TTP hunt and revisit once samples/hashes are published — expect significant tuning against legitimate side-loading in your environment.
+
+#### Vulnerable Apple iOS/macOS inventory for actively exploited CoreGraphics flaw
+- **Actor / Campaign:** Unattributed (targeted "extremely sophisticated" attacks)
+- **MITRE ATT&CK:** T1203 — Exploitation for Client Execution
+- **Data source:** DeviceTvmSoftwareInventory
+- **Source:** [9][11][12]
+
+```kql
+// Identify managed devices still running vulnerable iOS/iPadOS/macOS versions
+// affected by CVE-2026-86950 (CoreGraphics OOB write), now in CISA KEV
+DeviceTvmSoftwareInventory
+| where OSPlatform in ("iOS","iPadOS","macOS")
+| where SoftwareVendor =~ "apple"
+| where SoftwareName has_any ("ios","ipados","macos")
+// Update version thresholds per Apple's published fixed versions
+| where OSVersion < "26.1" // placeholder — replace with actual patched build number
+| project DeviceId, DeviceName, OSPlatform, OSVersion
+| take 100
+```
+
+*Note:* This is an inventory/patch-compliance hunt, not a compromise detection — no forensic IOCs for exploitation have been published; prioritize per BOD 26-04 and cross-check with MDM/Jamf/Intune for authoritative version data.
+
+> [1] Bitget hacked via zero-day in third-party security products — https://www.bleepingcomputer.com/news/security/bitget-hacked-via-zero-day-in-third-party-security-products/
+> [2] China-nexus UAT-11587 targets government and policy organizations across Asia with Antino backdoor — https://blog.talosintelligence.com/china-nexus-uat-11587-targets-government-and-policy-organizations-across-asia-with-antino-backdoor/
+> [3] Attackers Exploit NetScaler Flaw for Root Access, Deploy WHIPSHOT and SLAPSHOT — https://thehackernews.com/2026/09/attackers-exploit-netscaler-flaw-for.html
+> [4] Hackers exploit Citrix NetScaler zero-day to deploy web shells — https://www.bleepingcomputer.com/news/security/hackers-exploit-citrix-netscaler-zero-day-to-deploy-web-shells/
+> [5] Russia's Star Blizzard Targets 100+ Organizations With Fake Event Invites to Deliver Backdoor — https://thehackernews.com/2026/09/russias-star-blizzard-targets-100.html
+> [6] Beyond source code: A path to the keys to the kingdom — https://www.microsoft.com/en-us/security/blog/2026/09/29/beyond-source-code-a-path-to-the-keys-to-the-kingdom/
+> [7] Star Blizzard refines phishing and malware delivery with the RedFlick technique — https://www.microsoft.com/en-us/security/blog/2026/09/29/star-blizzard-refines-phishing-and-malware-delivery-with-the-redflick-technique/
+> [9] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/29/cisa-adds-one-known-exploited-vulnerability-catalog
+> [11] Apple patches CoreGraphics zero-day flaw exploited in attacks — https://www.bleepingcomputer.com/news/security/apple-patches-coregraphics-zero-day-flaw-exploited-in-attacks/
+> [12] CVE-2026-86950 — Apple Multiple Products Out-of-Bounds Write Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-86950
