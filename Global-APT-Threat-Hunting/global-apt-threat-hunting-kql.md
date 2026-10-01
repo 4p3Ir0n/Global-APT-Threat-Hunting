@@ -8686,3 +8686,159 @@ DeviceTvmSoftwareInventory
 > [9] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/29/cisa-adds-one-known-exploited-vulnerability-catalog
 > [11] Apple patches CoreGraphics zero-day flaw exploited in attacks — https://www.bleepingcomputer.com/news/security/apple-patches-coregraphics-zero-day-flaw-exploited-in-attacks/
 > [12] CVE-2026-86950 — Apple Multiple Products Out-of-Bounds Write Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-86950
+
+### 2026-10-01
+
+*Generated 2026-10-01 13:32 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### ScreenConnect Client Installed/Launched from Suspicious Parent Process
+- **Actor / Campaign:** unattributed (opportunistic RMM abuse)
+- **MITRE ATT&CK:** T1219 — Remote Access Software
+- **Data source:** DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("ScreenConnect.ClientService.exe", "ScreenConnect.WindowsClient.exe", "ConnectWiseControl.ClientService.exe")
+| where InitiatingProcessFileName in~ ("outlook.exe", "winword.exe", "excel.exe", "chrome.exe", "msedge.exe", "powershell.exe", "cmd.exe")
+| project Timestamp, DeviceName, FileName, FolderPath, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, AccountName
+| take 100
+```
+*Note:* ScreenConnect/ConnectWise Control is widely used legitimately for IT support; baseline known MSP/IT hostnames and installer paths before alerting, and focus on installs spawned from Office/browser/script processes rather than known deployment tooling.
+
+#### NetScaler Web Shell Served via CSS-Like URL Path
+- **Actor / Campaign:** unattributed (NetScaler mass-exploitation)
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell
+- **Data source:** CommonSecurityLog (NetScaler syslog/CEF ingestion)
+- **Source:** [6][8][17]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor =~ "Citrix" and DeviceProduct has "NetScaler"
+| where RequestURL matches regex @"\.css($|\?)" 
+| where RequestMethod =~ "POST"
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, RequestURL, RequestMethod, DeviceAction
+| take 100
+```
+*Note:* Legitimate requests to .css resources should be GET-only and served by the web server, not POST; this is a heuristic for the reported CSS-masquerading web shell and requires NetScaler logs forwarded via CEF/Syslog — validate field mapping against your connector.
+
+#### NetScaler Post-Exploitation Superuser/Account Creation
+- **Actor / Campaign:** unattributed (CVE-2026-88771/88772 exploitation)
+- **MITRE ATT&CK:** T1136 — Create Account
+- **Data source:** Syslog / CommonSecurityLog
+- **Source:** [6][8]
+
+```kql
+Syslog
+| where TimeGenerated > ago(14d)
+| where SyslogMessage has_any ("useradd", "superuser", "system user") and SyslogMessage has "nsroot"
+| project TimeGenerated, Computer, SyslogMessage
+| take 100
+```
+*Note:* Requires NetScaler appliance logs forwarded to Sentinel; tune the message patterns to your actual NetScaler audit log format, and cross-reference new accounts against change-management records.
+
+#### Zimbra SNMP-Triggered Command Injection Leading to Web Shell (CVE-2026-73570)
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1505.003 — Web Shell
+- **Data source:** DeviceProcessEvents (Linux)
+- **Source:** [10]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("snmpd", "zmconfigd", "httpd", "java")
+| where FileName in~ ("sh", "bash", "wget", "curl")
+| where FolderPath has "/opt/zimbra" or DeviceName has "zimbra"
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, FolderPath
+| take 100
+```
+*Note:* Zimbra servers with Defender for Endpoint on Linux installed only; adjust parent-process names to match the actual SNMP/Zimbra service binaries in your environment, and verify against the patch status of CVE-2026-73570.
+
+#### Cisco SD-WAN Manager Admin API Access Without Prior Authentication
+- **Actor / Campaign:** unattributed (CVE-2026-76504 exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1548 — Abuse Elevation Control Mechanism
+- **Data source:** CommonSecurityLog (vManage audit/syslog)
+- **Source:** [11][13][14][18]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor =~ "Cisco" and DeviceProduct has "SD-WAN"
+| where RequestURL has "/dataservice/"
+| where DeviceAction =~ "allow" and isempty(SourceUserName)
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, DeviceAction
+| take 100
+```
+*Note:* This is a KEV-listed, actively exploited auth bypass granting admin API access; requires vManage logs ingested into Sentinel. Correlate hits with management-plane exposure to the internet and prioritize per BOD 26-04.
+
+#### ClickFix-Style Script Execution from Explorer (Possible AI-Lure Delivery)
+- **Actor / Campaign:** unattributed (ChatGPT Custom GPT abuse / ClickFix)
+- **MITRE ATT&CK:** T1204.004 — User Execution: Malicious Copy and Paste; T1059.001 — PowerShell
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [12]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("powershell.exe", "cmd.exe", "mshta.exe")
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where ProcessCommandLine has_any ("-enc", "-w hidden", "-NoProfile", "IEX", "DownloadString", "FromBase64String")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+*Note:* This is the generic ClickFix "run dialog paste" execution chain and is noisy; enrich by joining to DeviceNetworkEvents for recent visits to chat.openai.com / custom-GPT-hosted redirect domains within the preceding minutes to raise fidelity.
+
+#### UAT-11587 Antino Backdoor Artifact String Hunt
+- **Actor / Campaign:** UAT-11587 (China-nexus)
+- **MITRE ATT&CK:** T1105 — Ingress Tool Transfer; T1588.002 — Obtain Capabilities: Tool
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [16]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName has "antino" or FolderPath has "antino"
+| project Timestamp, DeviceName, FileName, FolderPath, SHA256, InitiatingProcessAccountName
+| take 100
+union (
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has "antino"
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessAccountName
+)
+```
+*Note:* Talos reporting did not disclose concrete hashes/filenames beyond the developer-artifact backdoor name "Antino"; this is a low-confidence string hunt only useful if the actor reused the internal artifact name in the wild — scope to government/policy sector hosts in Taiwan, India, Philippines, Cambodia and pivot on any hits.
+
+#### Star Blizzard Browser-to-Script Execution Chain (RedFlick Tactic)
+- **Actor / Campaign:** Star Blizzard (RedFlick → CosmicPulse)
+- **MITRE ATT&CK:** T1566 — Phishing; T1218 — System Binary Proxy Execution
+- **Data source:** DeviceProcessEvents
+- **Source:** [7]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("chrome.exe", "msedge.exe", "firefox.exe")
+| where FileName in~ ("mshta.exe", "rundll32.exe", "regsvr32.exe", "powershell.exe")
+| where FolderPath has_any (@"\Downloads\", @"\AppData\Local\Temp\")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName, FolderPath
+| take 100
+```
+*Note:* Reporting describes a new "RedFlick" installation tactic for CosmicPulse but withholds granular IOCs; this hunts the generic browser-download-to-script-execution pattern typical of Star Blizzard spear-phishing and will need tuning against legitimate installer behavior in your environment.
+
+> [4] ScreenConnect Client (Ab)used by Attackers — https://isc.sans.edu/diary/rss/33388
+> [6] Citrix NetScaler Post-Exploitation Payload Creates Superuser, Maps Web Shell to CSS-Like URLs — https://thehackernews.com/2026/10/citrix-netscaler-post-exploitation.html
+> [7] Russian state hackers use new RedFlick technique to push malware — https://www.bleepingcomputer.com/news/security/russian-state-hackers-use-new-redflick-technique-to-push-malware/
+> [8] Threat Brief: NetScaler Zero Days CVE-2026-88771 and CVE-2026-88772 Exploited in the Wild — https://unit42.paloaltonetworks.com/netscaler-zero-days-exploited/
+> [10] Attackers Exploit Zimbra Flaw to Deploy Web Shells and Harvest Authentication Secrets — https://thehackernews.com/2026/09/attackers-exploit-zimbra-flaw-to-deploy.html
+> [11] Cisco Warns of Attackers Exploiting Critical Authentication Bypass in SD-WAN Manager — https://thehackernews.com/2026/09/cisco-warns-of-attackers-exploiting.html
+> [12] Attackers Abuse ChatGPT Custom GPTs to Deliver RAT via ClickFix Lures — https://thehackernews.com/2026/09/attackers-abuse-chatgpt-custom-gpts-to.html
+> [13] Cisco warns of new SD-WAN zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/cisco-warns-of-new-sd-wan-authentication-bypass-zero-day-exploited-in-attacks/
+> [14] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/09/30/cisa-adds-one-known-exploited-vulnerability-catalog
+> [16] China-nexus UAT-11587 targets government and policy organizations across Asia with Antino backdoor — https://blog.talosintelligence.com/china-nexus-uat-11587-targets-government-and-policy-organizations-across-asia-with-antino-backdoor/
+> [17] Attackers Exploit NetScaler Flaw for Root Access, Deploy WHIPSHOT and SLAPSHOT — https://thehackernews.com/2026/09/attackers-exploit-netscaler-flaw-for.html
+> [18] CVE-2026-76504 — Cisco Catalyst SD-WAN Manager Hex Encoding Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-76504
