@@ -8842,3 +8842,100 @@ DeviceProcessEvents
 > [16] China-nexus UAT-11587 targets government and policy organizations across Asia with Antino backdoor — https://blog.talosintelligence.com/china-nexus-uat-11587-targets-government-and-policy-organizations-across-asia-with-antino-backdoor/
 > [17] Attackers Exploit NetScaler Flaw for Root Access, Deploy WHIPSHOT and SLAPSHOT — https://thehackernews.com/2026/09/attackers-exploit-netscaler-flaw-for.html
 > [18] CVE-2026-76504 — Cisco Catalyst SD-WAN Manager Hex Encoding Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-76504
+
+### 2026-10-02
+
+*Generated 2026-10-02 13:29 UTC · model `claude-sonnet-5`*
+
+_Lint: 4 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### FortiMail Path Traversal / Arbitrary File Write Attempt (CVE-2026-104286)
+- **Actor / Campaign:** Unattributed (actively exploited zero-day)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (Fortinet CEF syslog) / AzureDiagnostics
+- **Source:** [2][3][9][14]
+
+```kql
+// Hunt for path traversal / NULL-byte patterns in requests to FortiMail web management interface
+// Requires FortiMail syslog forwarded via CEF connector into CommonSecurityLog
+CommonSecurityLog
+| where DeviceVendor =~ "Fortinet"
+| where DeviceProduct has_any ("FortiMail", "FML")
+| where RequestURL has_any ("../", "..\\", "%2e%2e%2f", "%2e%2e/", "..%2f", "\u0000", "%00")
+| extend SuspiciousPattern = iff(RequestURL has "%00" or RequestURL has "\u0000", "NullByte", "PathTraversal")
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, RequestURL, SuspiciousPattern, Message
+| take 100
+```
+
+*Note:* Column names (RequestURL, SourceIP) depend on the specific CEF mapping used for Fortinet logs in your environment — validate field mapping. This is a signature/pattern hunt, not a confirmed exploit indicator, since no concrete IOCs were published; tune against known-good admin traffic.
+
+#### Suspicious New File Writes on FortiMail Appliance Post-Exploitation
+- **Actor / Campaign:** Unattributed (CVE-2026-104286 exploitation)
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceFileEvents (if FortiMail/underlying OS is onboarded to Defender for Endpoint via Linux sensor or FIM forwarding)
+- **Source:** [2][3][14]
+
+```kql
+// Look for unexpected file creation in web-accessible directories shortly after exploitation window
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any ("/webmail", "/www", "/cgi-bin", "/tmp")
+| where ActionType in ("FileCreated", "FileModified")
+| where FileName endswith ".php" or FileName endswith ".cgi" or FileName endswith ".sh"
+| summarize Count = count(), Devices = make_set(DeviceName) by FileName, FolderPath, bin(Timestamp, 1h)
+| where Count > 0
+| take 100
+```
+
+*Note:* Heuristic and highly environment-dependent — FortiMail appliances are rarely Defender-onboarded endpoints; this is best paired with vendor-provided forensic triage and file integrity monitoring referenced in the CISA KEV advisory. Validate paths against your FortiMail deployment.
+
+#### WordPress "SC" Backdoor Self-Healing Persistence via Cron/Process Re-infection
+- **Actor / Campaign:** Unattributed ("SC" backdoor, per Sucuri research)
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell; T1053.003 — Scheduled Task/Job: Cron
+- **Data source:** DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+// Detect web server process (php-fpm/apache/nginx) spawning shell/cron activity used to re-create backdoor files
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("php-fpm", "php", "apache2", "httpd", "nginx", "www-data")
+| where FileName in~ ("bash", "sh", "crontab", "curl", "wget", "perl", "python", "python3")
+| where ProcessCommandLine has_any ("crontab", "SC_", "wp-content", "wp-config", "shmget", "shmop", "sysvshm")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* This is behavior-based since no file hashes/paths were disclosed; "SC_" is the only published marker string and likely only visible in web content, not process telemetry — tune `has_any` list to your WordPress hosting stack and expect FPs from legitimate cron/maintenance scripts.
+
+#### PHP Process Using Shared Memory / Database Functions Consistent With Self-Healing Backdoor
+- **Actor / Campaign:** Unattributed ("SC" WordPress backdoor)
+- **MITRE ATT&CK:** T1564 — Hide Artifacts; T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [6]
+
+```kql
+// Correlate PHP invocations referencing shared memory / DB-based payload storage with subsequent file writes to WordPress core paths
+let ShmProcs = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "php" or FileName =~ "php-fpm"
+| where ProcessCommandLine has_any ("shmop_open", "shm_attach", "msg_get_queue", "sem_get")
+| project Timestamp, DeviceName, ProcessCommandLine, InitiatingProcessAccountName;
+let SubsequentWrites = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has "wp-content" or FolderPath has "wp-includes"
+| where ActionType == "FileCreated";
+ShmProcs
+| join kind=inner (SubsequentWrites) on DeviceName
+| where SubsequentWrites_Timestamp := Timestamp1 between (Timestamp .. Timestamp + 10m)
+| project Timestamp, DeviceName, ProcessCommandLine, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* Query is exploratory/heuristic — no concrete process or file IOCs were published for the "SC" backdoor beyond the "SC_" content marker and the general technique (files + database + shared memory persistence); validate join logic/column names against your schema and expect tuning needed to reduce noise from legitimate PHP caching libraries.
+
+> [2] Critical FortiMail Zero-Day Flaw Exploited in Attacks Allows Unauthenticated Arbitrary File Writes — https://thehackernews.com/2026/10/critical-fortimail-zero-day-flaw.html
+> [3] Fortinet warns of critical FortiMail flaw exploited in zero-day attacks — https://www.bleepingcomputer.com/news/security/fortinet-warns-of-critical-fortimail-flaw-exploited-in-zero-day-attacks/
+> [6] WordPress Backdoor Rebuilds Itself After Cleanup Using Files, Database, and Shared Memory — https://thehackernews.com/2026/10/wordpress-backdoor-rebuilds-itself.html
+> [9] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/01/cisa-adds-one-known-exploited-vulnerability-catalog
+> [14] CVE-2026-104286 — Fortinet FortiMail: Fortinet FortiMail Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-104286
