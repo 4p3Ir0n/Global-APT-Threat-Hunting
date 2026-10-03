@@ -8939,3 +8939,144 @@ ShmProcs
 > [6] WordPress Backdoor Rebuilds Itself After Cleanup Using Files, Database, and Shared Memory — https://thehackernews.com/2026/10/wordpress-backdoor-rebuilds-itself.html
 > [9] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/01/cisa-adds-one-known-exploited-vulnerability-catalog
 > [14] CVE-2026-104286 — Fortinet FortiMail: Fortinet FortiMail Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-104286
+
+### 2026-10-03
+
+*Generated 2026-10-03 14:36 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Non-Outlook process beaconing to M365 mail/graph endpoints (Antino backdoor C2)
+- **Actor / Campaign:** China-nexus cluster tracked by Cisco Talos (Antino backdoor)
+- **MITRE ATT&CK:** T1102.002 — Web Service: Bidirectional Communication
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// Antino abuses Outlook/OneDrive APIs as C2 channels. No IOCs published yet,
+// so hunt for processes OTHER than expected Office/OneDrive binaries talking to M365 endpoints.
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any ("graph.microsoft.com", "outlook.office365.com", "outlook.office.com", "onedrive.live.com", "1drv.ms")
+| where InitiatingProcessFileName !in~ (
+    "outlook.exe","onedrive.exe","teams.exe","excel.exe","winword.exe","powerpnt.exe",
+    "searchprotocolhost.exe","msedge.exe","chrome.exe","explorer.exe"
+  )
+| summarize ConnCount = count(), RemoteUrls = make_set(RemoteUrl), Ports = make_set(RemotePort)
+    by DeviceId, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, InitiatingProcessAccountName
+| where ConnCount > 5
+| take 100
+```
+
+*Note:* Many legitimate scripts/add-ins use Graph APIs; build an allowlist of known business apps/automation tied to M365 before alerting. High false-positive risk until tuned per environment.
+
+#### Unusual process reading/writing OneDrive sync folder paired with outbound sync traffic (possible C2 channel)
+- **Actor / Campaign:** China-nexus cluster tracked by Cisco Talos (Antino backdoor)
+- **MITRE ATT&CK:** T1567.002 — Exfiltration to Cloud Storage
+- **Data source:** DeviceFileEvents, DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// Antino reportedly uses OneDrive for data staging/C2. Look for non-OneDrive processes
+// writing into the OneDrive sync folder shortly before network activity to OneDrive endpoints.
+let suspiciousWrites = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has @"\OneDrive\"
+| where InitiatingProcessFileName !in~ ("onedrive.exe","explorer.exe")
+| project Timestamp, DeviceId, DeviceName, InitiatingProcessFileName, FolderPath, FileName;
+let onedriveNet = DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any ("onedrive.live.com","1drv.ms")
+| project NetTime = Timestamp, DeviceId, InitiatingProcessFileName;
+suspiciousWrites
+| join kind=inner onedriveNet on DeviceId
+| where (NetTime - Timestamp) between (0min .. 10min)
+| take 100
+```
+
+*Note:* Needs tuning for environments with legitimate third-party OneDrive sync/backup tools; validate process hashes/signatures before escalating.
+
+#### Unauthenticated requests to Dell CSM csm-authorization-storage service (CVE-2026-63688)
+- **Actor / Campaign:** unattributed (opportunistic exploitation of Dell CSM)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** AKSAuditAdmin / AKSAudit (Kubernetes audit logs ingested to Sentinel)
+- **Source:** [2]
+
+```kql
+// Missing-authentication flaw in csm-authorization-storage gRPC server grants admin access.
+// Hunt Kubernetes API audit logs for anonymous/unauthenticated calls touching csm-authorization objects.
+AKSAuditAdmin
+| where TimeGenerated > ago(14d)
+| where RequestURI has_any ("csm-authorization", "csm-authorization-storage") or ObjectRef_Name has "csm-authorization"
+| where User_Username in ("system:anonymous", "") or isempty(User_Username)
+| where Verb in ("create", "update", "patch", "delete")
+| project TimeGenerated, User_Username, Verb, RequestURI, SourceIPs, ResponseStatus_code
+| take 100
+```
+
+*Note:* Column/table names vary by log pipeline (AKSAudit vs. Azure Monitor Container Insights); adjust to your ingested schema. No public IOCs exist yet — validate against patched/unpatched CSM versions.
+
+#### Privilege escalation to root on Kubernetes nodes via Dell CSM driver pods
+- **Actor / Campaign:** unattributed (opportunistic exploitation of Dell CSM)
+- **MITRE ATT&CK:** T1611 — Escape to Host
+- **Data source:** DeviceProcessEvents (Defender for Endpoint on Linux nodes)
+- **Source:** [2]
+
+```kql
+// Chained CSM flaws can grant root on Kubernetes worker nodes. Hunt for root-level process
+// creation initiated from CSI/CSM driver pod processes on protected Linux nodes.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFolderPath has_any ("csi-", "csm-", "dell-csm") 
+| where AccountName == "root"
+| where FileName in~ ("bash","sh","sudo","chroot","nsenter")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Requires Defender for Endpoint (or equivalent) telemetry on K8s nodes; tune folder-path filter to your actual CSM/CSI driver install paths.
+
+#### Zammad web process spawning shell/interpreter (possible CVE-2026-102489 RCE)
+- **Actor / Campaign:** unattributed (active exploitation per CISA KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [3][4][5]
+
+```kql
+// Session fixation (CVE-2026-102489) can lead to RCE as the zammad service account.
+// Hunt for shell/interpreter child processes spawned by the zammad app/web process.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessAccountName =~ "zammad"
+| where FileName in~ ("bash","sh","dash","curl","wget","python","python3","perl","nc","ncat")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* Legitimate Zammad maintenance scripts/cron jobs may run shells as this account; baseline normal admin scripting before alerting, and confirm Zammad version is unpatched for CVE-2026-102489.
+
+#### Zammad service account escalating to root (CVE-2026-102490)
+- **Actor / Campaign:** unattributed (active exploitation per CISA KEV)
+- **MITRE ATT&CK:** T1068 — Exploitation for Privilege Escalation
+- **Data source:** DeviceProcessEvents
+- **Source:** [3][4][5]
+
+```kql
+// Improper privilege management lets the local zammad user escalate to root (CVE-2026-102490),
+// often chained with the session fixation RCE (CVE-2026-102489).
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessAccountName =~ "zammad"
+| where FileName in~ ("sudo","su","pkexec","chmod","chown","passwd") 
+    or ProcessCommandLine has_any ("setuid", "/etc/passwd", "/etc/shadow", "visudo")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, InitiatingProcessAccountName, AccountName
+| take 100
+```
+
+*Note:* Flag especially any resulting process whose effective AccountName becomes root; cross-reference with patch status and treat any hit as high-priority given KEV status and chainability with CVE-2026-102489.
+
+> [1] Antino Backdoor Uses Outlook and OneDrive for C2 in China-Nexus Espionage Campaign — https://thehackernews.com/2026/10/antino-backdoor-uses-outlook-and.html
+> [2] Dell CSM Flaws Enable Unauthenticated Admin Access and Root on Kubernetes Nodes — https://thehackernews.com/2026/10/dell-csm-flaws-enable-unauthenticated.html
+> [3] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/02/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [4] CVE-2026-102490 — Zammad GmbH Zammad Improper Privilege Management Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-102490
+> [5] CVE-2026-102489 — Zammad GmbH Zammad Session Fixation Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-102489
