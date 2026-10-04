@@ -9080,3 +9080,144 @@ DeviceProcessEvents
 > [3] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/02/cisa-adds-two-known-exploited-vulnerabilities-catalog
 > [4] CVE-2026-102490 — Zammad GmbH Zammad Improper Privilege Management Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-102490
 > [5] CVE-2026-102489 — Zammad GmbH Zammad Session Fixation Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-102489
+
+### 2026-10-04
+
+*Generated 2026-10-04 15:00 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Credential Phishing Impersonating Policy/AI Figures (TA419-style lure)
+- **Actor / Campaign:** TA419 (China-nexus)
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link
+- **Data source:** EmailEvents, EmailUrlInfo
+- **Source:** [1]
+
+```kql
+// Looks for inbound mail where the display name impersonates a well-known expert/brand
+// but sender domain doesn't match known org domains - tune the name list to your target VIPs.
+EmailEvents
+| where Timestamp > ago(14d)
+| where SenderDisplayName has_any ("Anthropic", "AI Policy", "Economist") // tune: add specific impersonated names once known
+| where SenderFromDomain !has_any ("anthropic.com") // replace with your org's allow-list of legitimate domains
+| join kind=inner (EmailUrlInfo) on NetworkMessageId
+| where UrlDomain !has_any ("microsoft.com","microsoftonline.com","office.com")
+| project Timestamp, SenderDisplayName, SenderFromAddress, RecipientEmailAddress, Subject, UrlDomain, Url
+| take 100
+```
+
+*Note:* Heuristic — relies on impersonation of named individuals/brands mentioned in the reporting; high false-positive risk, best used as a triage list rather than an alert, and should be tuned with actual observed sender/display-name patterns as they emerge.
+
+#### Possible AitM Token Theft Following Microsoft-Branded Phishing
+- **Actor / Campaign:** TA419 (China-nexus)
+- **MITRE ATT&CK:** T1557 — Adversary-in-the-Middle / T1528 — Steal Application Access Token
+- **Data source:** SigninLogs, AADSignInEventsBeta
+- **Source:** [1]
+
+```kql
+// Flags sign-ins where MFA was satisfied but the session token/IP immediately shifts
+// to a new, geographically inconsistent IP within minutes - classic AitM proxy pattern.
+SigninLogs
+| where TimeGenerated > ago(14d)
+| where ResultType == 0
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| summarize IPs = make_set(IPAddress), Countries = make_set(LocationDetails.countryOrRegion), Count = count()
+    by UserPrincipalName, bin(TimeGenerated, 1h)
+| where array_length(IPs) > 1 or array_length(Countries) > 1
+| take 100
+```
+
+*Note:* Classic AitM/session-cookie-replay indicator; tune the time bin and exclude known VPN/corporate egress IP ranges to reduce noise.
+
+#### Suspicious OAuth App Consent After Phishing Click
+- **Actor / Campaign:** TA419 (China-nexus)
+- **MITRE ATT&CK:** T1528 — Steal Application Access Token
+- **Data source:** AuditLogs (Sentinel) / CloudAppEvents
+- **Source:** [1]
+
+```kql
+// New or rarely-seen OAuth app granted mail/profile read scopes shortly after a risky sign-in.
+AuditLogs
+| where TimeGenerated > ago(14d)
+| where OperationName in ("Consent to application", "Add OAuth2PermissionGrant")
+| extend AppDisplayName = tostring(TargetResources[0].displayName)
+| where AppDisplayName !in ("Microsoft Teams", "Office 365") // tune allow-list
+| project TimeGenerated, InitiatedBy, AppDisplayName, Result
+| take 100
+```
+
+*Note:* AitM phishing kits often follow credential capture with OAuth consent-phishing to persist access; validate newly consented apps against your tenant's known-good app list.
+
+#### w3wp.exe Spawning Shell/Script Interpreters (SharePoint Exploitation)
+- **Actor / Campaign:** Warlock
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "w3wp.exe"
+| where FileName has_any ("cmd.exe","powershell.exe","pwsh.exe","cscript.exe","wscript.exe","mshta.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Classic post-exploitation signature for SharePoint RCE chains (e.g., ToolShell-family CVEs); legitimate SharePoint admin scripts can trigger this, so validate command line content and account context.
+
+#### SharePoint Worker Process Writing Web Shell / ASPX to Web Root
+- **Actor / Campaign:** Warlock
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceFileEvents
+- **Source:** [3]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "w3wp.exe"
+| where FileName endswith ".aspx" or FileName endswith ".ashx"
+| where FolderPath has_any ("\\LAYOUTS\\", "\\Templates\\", "wwwroot")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* SharePoint should rarely write new ASPX files post-deployment; validate against known patch/update activity before alerting.
+
+#### Security Tooling Tampering Prior to Ransomware Deployment
+- **Actor / Campaign:** Warlock
+- **MITRE ATT&CK:** T1562.001 — Impair Defenses: Disable or Modify Tools
+- **Data source:** DeviceProcessEvents, DeviceRegistryEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("sc.exe","net.exe","powershell.exe","taskkill.exe")
+| where ProcessCommandLine has_any ("stop", "disable", "uninstall") 
+    and ProcessCommandLine has_any ("Defender","Sense","WinDefend","MsMpEng","Sophos","CarbonBlack","Symantec","SentinelOne","CrowdStrike")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Symantec/Carbon Black reporting flags security-tool disabling as a precursor to ransomware deployment in this campaign; tune the vendor name list to products actually deployed in your environment.
+
+#### Mass File Encryption / Shadow Copy Deletion (Ransomware Stage)
+- **Actor / Campaign:** Warlock
+- **MITRE ATT&CK:** T1486 — Data Encrypted for Impact / T1490 — Inhibit System Recovery
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("vssadmin.exe","wbadmin.exe","bcdedit.exe")
+| where ProcessCommandLine has_any ("delete shadows","catalog","recoveryenabled no")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Standard pre-ransomware recovery-sabotage pattern; correlate with the SharePoint exploitation and defense-tampering detections above for higher confidence given this is behavior common to many ransomware families, not unique to Warlock.
+
+> [1] China-Aligned TA419 Targets U.S. AI Policy Experts With Microsoft AitM Phishing — https://thehackernews.com/2026/10/china-aligned-ta419-targets-us-ai.html
+> [2] MI5 Says China's MSS Funded Research Involving 100+ U.K.-Linked Academics — https://thehackernews.com/2026/10/mi5-says-chinas-mss-funded-research.html
+> [3] Warlock Exploits SharePoint Flaws to Disable Security Tools and Deploy Ransomware — https://thehackernews.com/2026/10/warlock-exploits-sharepoint-flaws-to.html
