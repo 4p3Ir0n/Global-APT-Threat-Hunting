@@ -9221,3 +9221,162 @@ DeviceProcessEvents
 > [1] China-Aligned TA419 Targets U.S. AI Policy Experts With Microsoft AitM Phishing — https://thehackernews.com/2026/10/china-aligned-ta419-targets-us-ai.html
 > [2] MI5 Says China's MSS Funded Research Involving 100+ U.K.-Linked Academics — https://thehackernews.com/2026/10/mi5-says-chinas-mss-funded-research.html
 > [3] Warlock Exploits SharePoint Flaws to Disable Security Tools and Deploy Ransomware — https://thehackernews.com/2026/10/warlock-exploits-sharepoint-flaws-to.html
+
+### 2026-10-05
+
+*Generated 2026-10-05 13:37 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### ATM XFS Manager Process Interaction Consistent with Ploutus-Style Jackpotting
+- **Actor / Campaign:** Ploutus (ATM malware) — unattributed intrusion set
+- **MITRE ATT&CK:** T1565.002 — Data Manipulation: Transmitted Data Manipulation (ATM-specific), T1055 — Process Injection
+- **Data source:** DeviceProcessEvents, DeviceImageLoadEvents
+- **Source:** [1]
+
+```kql
+// Behavioral hunt: Ploutus-family ATM malware interacts with the XFS (eXtensions for Financial Services) manager
+// via msxfs.dll to issue dispense commands. No concrete IOCs were published for the arrested developer's malware,
+// so this looks for processes loading the XFS library outside of known ATM vendor software paths.
+DeviceImageLoadEvents
+| where FileName =~ "msxfs.dll"
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+) on $left.InitiatingProcessId == $right.ProcessId, $left.DeviceId == $right.DeviceId
+| where InitiatingProcessFolderPath !has_any ("NCR", "Diebold", "Wincor", "AptraXFS", "Program Files\\ATM")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, InitiatingProcessCommandLine
+| take 100
+```
+
+*Note:* No file hashes or filenames were published in the source; this is purely behavioral and will require tuning to the specific ATM vendor software baseline in your estate (allow-list legitimate XFS consumers) to avoid noise on actual ATM/kiosk fleets.
+
+#### STUN Protocol Used as Covert C2 Channel (Cling Botnet via Realtek Jungle SDK)
+- **Actor / Campaign:** Cling botnet (unattributed)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application, T1071.001/T1571 — Application Layer Protocol / Non-Standard Port (STUN abuse for C2)
+- **Data source:** DeviceNetworkEvents, CommonSecurityLog (firewall/IoT telemetry)
+- **Source:** [2]
+
+```kql
+// Cling repurposes STUN (normally UDP/3478 or TCP binding requests) as a C2 channel after exploiting
+// a patched Realtek Jungle SDK flaw. Defender XDR typically does not cover embedded/IoT devices directly,
+// so hunt via network/firewall telemetry ingested into Sentinel for STUN traffic to/from devices that
+// should not normally use STUN (routers, cameras, embedded Linux devices).
+CommonSecurityLog
+| where DeviceEventClassID has_any ("3478", "stun") or DestinationPort == 3478 or SourcePort == 3478
+| where Protocol in ("UDP", "TCP")
+| summarize ConnCount = count(), DestIPs = make_set(DestinationIP), SourceIPs = make_set(SourceIP) by DeviceVendor, DeviceProduct, bin(TimeGenerated, 1h)
+| where ConnCount > 20
+| take 100
+```
+
+*Note:* No IOCs (IP/domains) were published; this relies on identifying anomalous STUN usage from IoT/embedded network segments and will need an allow-list for legitimate VoIP/WebRTC STUN traffic to reduce false positives.
+
+#### Exploit Attempts Against Realtek Jungle SDK Services (Pre-Cling Deployment)
+- **Actor / Campaign:** Cling botnet (unattributed)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceNetworkEvents, CommonSecurityLog
+- **Source:** [2]
+
+```kql
+// Hunt for exploitation attempts against embedded web management services typically running on Realtek
+// Jungle SDK-based devices (routers/IoT), characterized by rapid repeated HTTP requests to management
+// interfaces from a single source, often followed shortly by a STUN-based outbound connection.
+CommonSecurityLog
+| where DestinationPort in (80, 8080, 443) 
+| where RequestURL has_any ("cgi-bin", "boa", "goform", "formLogin")
+| summarize RequestCount = count(), Paths = make_set(RequestURL) by SourceIP, DestinationIP, bin(TimeGenerated, 10m)
+| where RequestCount > 15
+| take 100
+```
+
+*Note:* Heuristic only — no specific exploit URI or signature was disclosed in the source; tune request-count thresholds and path keywords to your device management interfaces.
+
+#### NetScaler Service Crash/Restart Pattern Consistent with CVE-2026-88779 DoS Exploitation
+- **Actor / Campaign:** Unattributed (targeted zero-day attacks against NetScaler ADC/Gateway)
+- **MITRE ATT&CK:** T1499 — Endpoint Denial of Service, T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (Citrix NetScaler syslog), AzureDiagnostics
+- **Source:** [4][6][7][8]
+
+```kql
+// CVE-2026-88779 is a memory overflow in NetScaler ADC/Gateway SAML handling leading to DoS.
+// Hunt for NetScaler syslog entries indicating service crashes/restarts of the nsppe or aslearning
+// processes, or repeated SAML authentication failures immediately preceding a restart, clustered
+// from a small number of external source IPs (possible exploit probing).
+CommonSecurityLog
+| where DeviceVendor == "Citrix" or Process has_any ("nsppe", "aslearning", "ns_gui")
+| where Activity has_any ("crash", "restart", "core dumped", "SIGSEGV")
+| summarize CrashCount = count(), Sources = make_set(SourceIP) by DeviceName, bin(TimeGenerated, 1h)
+| where CrashCount >= 2
+| take 100
+```
+
+*Note:* Field/schema names depend on your NetScaler syslog CEF mapping; validate against your log source before deploying. This is a crash-pattern heuristic since no exploit payload IOC was published.
+
+#### Repeated External Requests to NetScaler SAML Endpoints Prior to Patch
+- **Actor / Campaign:** Unattributed (CVE-2026-88779 zero-day exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog
+- **Source:** [4][6][7][8]
+
+```kql
+// Identify anomalous volumes of SAML-related requests to NetScaler Gateway/ADC endpoints, which could
+// indicate exploitation attempts against the CVE-2026-88779 memory overflow in SAML processing.
+CommonSecurityLog
+| where RequestURL has_any ("/saml", "/logon/LogonPoint", "/cgi/samlauth")
+| summarize ReqCount = count(), DistinctURLs = dcount(RequestURL) by SourceIP, DestinationIP, bin(TimeGenerated, 15m)
+| where ReqCount > 50
+| order by ReqCount desc
+| take 100
+```
+
+*Note:* Tune thresholds to your normal SAML SSO traffic volume; pair with CISA KEV guidance to also confirm patch status and check for pre-patch compromise per BOD 26-04 forensic triage requirements [7][8].
+
+#### Post-Login Reconnaissance Command Chains on Exposed Linux Hosts (DShield TTY Pattern)
+- **Actor / Campaign:** Opportunistic bots/actors (SANS DShield sensor observations)
+- **MITRE ATT&CK:** T1059.004 — Command and Scripting Interpreter: Unix Shell, T1082 — System Information Discovery
+- **Data source:** DeviceProcessEvents (Linux), Syslog
+- **Source:** [5]
+
+```kql
+// Based on SANS ISC TTY log analysis of attacker/bot behavior on an exposed honeypot sensor: actors
+// commonly run recon commands (uname, whoami, id, cat /etc/*release) immediately after a successful
+// login, often scripted as a single command chain. Hunt for this behavior on internet-facing Linux hosts.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in ("uname", "whoami", "id", "cat", "wget", "curl")
+| summarize CommandsSeen = make_set(ProcessCommandLine), CmdCount = count() by DeviceName, InitiatingProcessAccountName, bin(Timestamp, 2m)
+| where CmdCount >= 4
+| take 100
+```
+
+*Note:* Heuristic behavioral pattern derived from the SANS diary rather than named IOCs; expect noise on admin/ops hosts and tune the command set/time window, or correlate with new/unexpected logon sessions (IdentityLogonEvents) for higher fidelity.
+
+#### Direct Modification of macOS TCC Database to Grant Full Disk Access
+- **Actor / Campaign:** Unattributed (relevant to AI agent abuse of macOS FDA per Apple's announcement)
+- **MITRE ATT&CK:** T1548 — Abuse Elevation Control Mechanism, T1222 — File and Directory Permissions Modification
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+// Apple flagged risk from apps/AI agents leveraging Full Disk Access (FDA) in ways users don't fully
+// understand. Hunt for processes directly writing to the TCC.db database (bypassing the normal
+// System Settings > Privacy consent UI), a known technique to silently grant FDA.
+DeviceFileEvents
+| where FolderPath has "Library/Application Support/com.apple.TCC"
+| where FileName == "TCC.db"
+| where InitiatingProcessFileName !in ("tccd", "System Settings", "System Preferences")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, ActionType, FolderPath
+| take 100
+```
+
+*Note:* Requires Defender for Endpoint on macOS with file monitoring enabled for the TCC path; legitimate MDM/config profile tools may also write here, so allow-list known management agents before alerting.
+
+> [1] Alleged dev of Ploutus ATM malware appears in US court after arrest — https://www.bleepingcomputer.com/news/security/suspected-dev-of-ploutus-atm-malware-appears-in-us-court-after-arrest/
+> [2] Realtek Jungle SDK Exploit Attempts Deliver Cling Botnet With STUN-Based C2 — https://thehackernews.com/2026/10/realtek-jungle-sdk-exploit-attempts.html
+> [3] Apple Plans Tighter macOS Full Disk Access Controls Over AI Agent Data Access — https://thehackernews.com/2026/10/apple-plans-tighter-macos-full-disk.html
+> [4] New NetScaler Zero-Day Exploited in Targeted Attacks Can Knock SAML Deployments Offline — https://thehackernews.com/2026/10/new-netscaler-zero-day-exploited-in.html
+> [5] TTY Logs and the Data it Captures, (Sun, Oct 4th) — https://isc.sans.edu/diary/rss/33396
+> [6] Citrix patches NetScaler SAML zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/citrix-patches-netscaler-saml-zero-day-exploited-in-attacks/
+> [7] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/04/cisa-adds-one-known-exploited-vulnerability-catalog
+> [8] CVE-2026-88779 — Citrix NetScaler Improper Restriction of Operations within the Bounds of a Memory Buffer Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-88779
