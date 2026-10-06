@@ -9380,3 +9380,86 @@ DeviceFileEvents
 > [6] Citrix patches NetScaler SAML zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/citrix-patches-netscaler-saml-zero-day-exploited-in-attacks/
 > [7] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/04/cisa-adds-one-known-exploited-vulnerability-catalog
 > [8] CVE-2026-88779 — Citrix NetScaler Improper Restriction of Operations within the Bounds of a Memory Buffer Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-88779
+
+### 2026-10-06
+
+*Generated 2026-10-06 13:30 UTC · model `claude-sonnet-5`*
+
+_Lint: 4 KQL block(s) — query 3: unbalanced '()'. All queries are CANDIDATES; validate before use._
+
+#### Execution of RMM Tooling from User-Writable Paths
+- **Actor / Campaign:** unattributed (ongoing RMM abuse trend)
+- **MITRE ATT&CK:** T1219 — Remote Access Software
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName has_any (
+    "screenconnect", "connectwisecontrol", "anydesk", "atera", "syncro",
+    "splashtop", "logmein", "teamviewer", "ninjaone", "rustdesk",
+    "meshagent", "simple-help", "getscreen", "gotoassist"
+)
+| where FolderPath has_any ("\\Temp\\", "\\Downloads\\", "\\AppData\\Local\\Temp\\", "\\Users\\Public\\")
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessAccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* The SANS diary did not name a specific new RMM tool, only that another one was found abused in the wild; this is a generic behavioral heuristic flagging legitimate RMM binaries launched from staging/user-writable directories, a common signature of unauthorized/attacker-driven installs. Tune the tool list to your environment's approved RMM software and expect noise from legitimate IT staging.
+
+#### Possible STUN-Based C2 Beaconing (Cling Botnet Pattern)
+- **Actor / Campaign:** Cling botnet (Realtek Jungle SDK exploitation)
+- **MITRE ATT&CK:** T1095 — Non-Application Layer Protocol
+- **Data source:** DeviceNetworkEvents
+- **Source:** [5]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(1d)
+| where RemotePort in (3478, 5349) and Protocol == "Udp"
+| summarize ConnCount = count(), DistinctRemoteIPs = dcount(RemoteIP) by DeviceName, LocalIP, bin(Timestamp, 1h)
+| where ConnCount > 20
+| project Timestamp = bin, DeviceName, LocalIP, ConnCount, DistinctRemoteIPs
+| take 100
+```
+
+*Note:* Cling abuses ordinary STUN (UDP/3478 and 5349) traffic as a C2 channel, so this is purely a volumetric/behavioral heuristic — no IOCs (IPs/domains/hashes) were published in the source. Legitimate VoIP/WebRTC/NAT traversal traffic will also hit these ports, so baseline normal STUN usage in your environment before alerting, and prioritize unmanaged/embedded/IoT devices.
+
+#### Realtek Jungle SDK — Possible Embedded Device Exploitation Attempt
+- **Actor / Campaign:** Cling botnet operators
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (firewall/IPS/WAF logs for exposed embedded web management interfaces)
+- **Source:** [5]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(1d)
+| where RequestURL has_any ("boa.cgi", "formLogin", "goform", "setup.cgi")
+| where RequestURL matches regex @"(\$\(|;|\|\||&&|wget |tftp |busybox)"
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, DeviceVendor, DeviceProduct
+| take 100
+```
+
+*Note:* No CVE ID, path, or payload details were published in this item, so the URL/command-injection pattern is a generic heuristic for embedded-device CGI exploitation rather than a Cling-specific signature; expect false positives from vulnerability scanners and requires field-mapping to your actual firewall/IPS log schema.
+
+#### ATM Malware (Ploutus-style) — XFS/CEN Middleware Interaction
+- **Actor / Campaign:** Ploutus ATM malware (developer arrested)
+- **MITRE ATT&CK:** T1055 — Process Injection (ATM middleware abuse)
+- **Data source:** DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName has_any ("xfs_", "msxfs.dll", "ifsconf.dll")
+    or ProcessCommandLine has_any ("cen/xfs", "msxfs")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* The BleepingComputer article is about a legal/arrest development and contains no new technical IOCs; this query is built from publicly known Ploutus/XFS-abuse TTPs for awareness on ATM-adjacent endpoints only — it is not grounded in new technical detail from today's source and will require ATM-platform-specific tuning (most enterprise EDR does not cover ATM OS images).
+
+> [1] More RMM Tools In the Wild — https://isc.sans.edu/diary/rss/33400
+> [4] Alleged dev of Ploutus ATM malware appears in US court after arrest — https://www.bleepingcomputer.com/news/security/suspected-dev-of-ploutus-atm-malware-appears-in-us-court-after-arrest/
+> [5] Realtek Jungle SDK Exploit Attempts Deliver Cling Botnet With STUN-Based C2 — https://thehackernews.com/2026/10/realtek-jungle-sdk-exploit-attempts.html
