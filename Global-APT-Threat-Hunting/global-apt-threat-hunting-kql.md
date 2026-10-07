@@ -9463,3 +9463,151 @@ DeviceProcessEvents
 > [1] More RMM Tools In the Wild — https://isc.sans.edu/diary/rss/33400
 > [4] Alleged dev of Ploutus ATM malware appears in US court after arrest — https://www.bleepingcomputer.com/news/security/suspected-dev-of-ploutus-atm-malware-appears-in-us-court-after-arrest/
 > [5] Realtek Jungle SDK Exploit Attempts Deliver Cling Botnet With STUN-Based C2 — https://thehackernews.com/2026/10/realtek-jungle-sdk-exploit-attempts.html
+
+### 2026-10-07
+
+*Generated 2026-10-07 13:33 UTC · model `claude-sonnet-5`*
+
+_Lint: 7 KQL block(s) — query 6: placeholder-like token 'placeholder'. All queries are CANDIDATES; validate before use._
+
+#### Atlassian Data Center Arbitrary File Access Exploitation (CVE-2026-21589)
+- **Actor / Campaign:** unattributed (mass exploitation within 2 hours of disclosure)
+- **MITRE ATT&CK:** T1190 — Exploitation of Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// Look for the Atlassian Data Center Java process (Confluence/Jira/Bitbucket) spawning
+// shell/utility processes, consistent with post-exploitation after arbitrary file read/RCE
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where InitiatingProcessFileName in~ ("java.exe","java")
+| where InitiatingProcessCommandLine has_any ("confluence", "jira", "bitbucket", "atlassian")
+| where FileName in~ ("cmd.exe","powershell.exe","powershell_ise.exe","bash","sh","wget","curl","nc","ncat","python","python3")
+| project Timestamp, DeviceName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Atlassian Data Center apps normally run under Java and rarely spawn shells/utilities; any such child process shortly after patch Tuesday should be triaged. Tune the `InitiatingProcessCommandLine` filter to your actual install paths/service names and add file-read telemetry (e.g., access to `web.xml`, `.properties`, or credential files) if your EDR captures DeviceFileEvents for the app server.
+
+#### WordPress Plugin XSS-to-Backdoor (Ninja Forms / WPC Product Bundles)
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1190 — Exploitation of Public-Facing Application; T1505.003 — Web Shell
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+// New PHP files dropped into wp-content via the web server process, or shell spawned
+// by www-data/php-fpm/IIS worker — indicative of post-XSS backdoor install
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath has "wp-content"
+| where FileName endswith ".php"
+| where InitiatingProcessFileName in~ ("php-fpm","php","w3wp.exe","httpd","nginx","apache2")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, RequestAccountName
+| take 100
+```
+
+*Note:* High value if your web server runs under a distinct service account — flag any PHP write by the web process outside expected plugin update windows. Combine with WordPress admin audit logs (new admin user creation) for higher confidence; this query alone will need baselining against legitimate plugin auto-update activity.
+
+#### Credential/MFA Harvesting via Fake AI Advertising Portals
+- **Actor / Campaign:** unattributed "human-operated phishing platform"
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link; T1111 — Multi-Factor Authentication Interception
+- **Data source:** EmailEvents, UrlClickEvents
+- **Source:** [5]
+
+```kql
+// Behavioral: emails/clicks referencing AI advertising/campaign portals for brands
+// (ChatGPT, Gemini, Claude, Perplexity, Muse, Manus) landing on non-vendor domains
+let aiBrands = dynamic(["chatgpt","openai","gemini","claude","anthropic","perplexity","meta muse","manus"]);
+EmailEvents
+| where Timestamp > ago(3d)
+| where Subject has_any (aiBrands) or EmailEvents has_any (aiBrands)
+| where SenderFromDomain !has_any ("openai.com","google.com","anthropic.com","perplexity.ai","meta.com")
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject, SenderFromDomain
+| join kind=inner (
+    UrlClickEvents
+    | where Timestamp > ago(3d)
+    | where Url has_any ("ads","campaign","business","audit")
+) on $left.NetworkMessageId == $right.NetworkMessageId
+| take 100
+```
+
+*Note:* No concrete domains/IOCs were published in this report, so this is a heuristic keyword-based hunt; expect false positives from legitimate marketing emails and requires tuning the brand/keyword list and excluding known vendor domains.
+
+#### Linux Process Masquerading as Email Security Component (Telecom/Network Appliance Backdoor)
+- **Actor / Campaign:** unattributed (targeting telecom/network appliances in South Korea & Taiwan)
+- **MITRE ATT&CK:** T1036.004 — Masquerading: Masquerade Task or Service; T1071.001/T1571 — Application Layer Protocol / Non-Standard Port
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [6]
+
+```kql
+// Flag processes named like mail/email-security binaries but running from
+// non-standard locations or with unusual parent processes — a known evasion
+// technique for Linux backdoors on telecom/network appliances
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("sendmail","postfix","smtpd","exim","dovecot","clamd","amavisd","spamd")
+| where FolderPath !startswith "/usr/sbin" and FolderPath !startswith "/usr/lib" and FolderPath !startswith "/opt"
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessFileName, ProcessCommandLine
+| take 100
+```
+
+```kql
+// Companion network view: same "email service" process names making outbound
+// connections that don't match normal SMTP/IMAP ports
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("sendmail","postfix","smtpd","exim","dovecot")
+| where RemotePort !in (25, 465, 587, 143, 993, 110, 995)
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemotePort, RemoteUrl
+| take 100
+```
+
+*Note:* No file hashes/names were disclosed in the source, so this is purely behavioral; legitimate mail servers/appliances outside `/usr/sbin` or `/usr/lib`, or using nonstandard ports for internal relaying, will cause noise — baseline per-appliance before alerting.
+
+#### Suspicious RMM Tool Installation/Abuse
+- **Actor / Campaign:** unattributed (trend following prior ScreenConnect abuse)
+- **MITRE ATT&CK:** T1219 — Remote Access Software
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [7]
+
+```kql
+// Generic detection for installation/execution of common RMM tools outside
+// of known IT-managed deployment accounts/paths — tune the tool list to your
+// approved RMM baseline, since SANS notes attackers are rotating through many tools
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName has_any ("screenconnect","connectwisecontrol","atera","splashtop","anydesk","teamviewer",
+                           "ninjaone","ninjarmm","syncro","meshagent","rustdesk","supremo","dwservice")
+| where InitiatingProcessAccountName !in ("expected_it_admin_accounts") // placeholder - adjust to your allowlist
+| project Timestamp, DeviceName, FileName, FolderPath, AccountName, ProcessCommandLine
+| take 100
+```
+
+*Note:* RMM detections are inherently high-FP in environments where IT legitimately uses these tools — restrict to unmanaged/unauthorized RMM binaries not on your approved software list, and correlate with first-seen-on-device logic.
+
+#### Unauthenticated Access to Hitachi Energy Asset Suite Test Servlets
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1190 — Exploitation of Public-Facing Application; T1595.002 — Vulnerability Scanning
+- **Data source:** CommonSecurityLog (firewall/WAF/proxy feed)
+- **Source:** [9]
+
+```kql
+// Hunt for requests to the unauthenticated test servlets disclosed for
+// Hitachi Energy Asset Suite (<=9.9.0), used for config upload / info disclosure
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where RequestURL has_any ("HTTPPublishAdapterTestServlet", "PropertiesReloadServlet")
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, DeviceAction, Message
+| take 100
+```
+
+*Note:* Column/table names depend on your network/WAF log ingestion (CEF via CommonSecurityLog assumed here); if Asset Suite access logs are ingested separately, adapt the table/field names accordingly. Any external or unexpected internal source hitting these test servlet paths warrants immediate investigation per CISA's mitigation guidance (disable the servlets).
+
+> [1] Atlassian Data Center Flaw Draws Exploitation Attempts Within Two Hours of Public Details — https://thehackernews.com/2026/10/atlassian-data-center-flaw-draws.html
+> [3] Ninja Forms plugin flaw exploited to hack WordPress sites — https://www.bleepingcomputer.com/news/security/ninja-forms-plugin-flaw-exploited-to-hack-wordpress-sites/
+> [5] Fake ChatGPT, Gemini, and Claude Ad Portals Capture Credentials and MFA Codes — https://thehackernews.com/2026/10/fake-chatgpt-gemini-and-claude-ad.html
+> [6] Linux Backdoors Impersonate Email Security Tools to Evade Detection in Korea and Taiwan — https://thehackernews.com/2026/10/linux-backdoors-impersonate-email.html
+> [7] More RMM Tools In the Wild — https://isc.sans.edu/diary/rss/33400
+> [9] Hitachi Energy Asset Suite — https://www.cisa.gov/news-events/ics-advisories/icsa-26-279-03
