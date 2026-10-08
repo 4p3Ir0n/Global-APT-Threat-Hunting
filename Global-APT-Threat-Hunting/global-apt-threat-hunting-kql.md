@@ -9611,3 +9611,202 @@ CommonSecurityLog
 > [6] Linux Backdoors Impersonate Email Security Tools to Evade Detection in Korea and Taiwan — https://thehackernews.com/2026/10/linux-backdoors-impersonate-email.html
 > [7] More RMM Tools In the Wild — https://isc.sans.edu/diary/rss/33400
 > [9] Hitachi Energy Asset Suite — https://www.cisa.gov/news-events/ics-advisories/icsa-26-279-03
+
+### 2026-10-08
+
+*Generated 2026-10-08 13:35 UTC · model `claude-sonnet-5`*
+
+_Lint: 11 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### AI-themed event-lure spear-phishing emails (UAT-11985)
+- **Actor / Campaign:** UAT-11985
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link
+- **Data source:** EmailEvents, EmailAttachmentInfo
+- **Source:** [1]
+
+```kql
+let LureTerms = dynamic(["symposium","invitation","conference","forum","roundtable","workshop","policy dialogue","summit"]);
+EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| where Subject has_any (LureTerms)
+| where SenderDisplayName has_any ("Institute","Foundation","Center","Association","University") // tune: impersonation of academic/policy orgs
+| join kind=inner (
+    EmailAttachmentInfo
+    | where Timestamp > ago(7d)
+) on NetworkMessageId
+| project Timestamp, SenderFromAddress, SenderDisplayName, RecipientEmailAddress, Subject, FileName
+| take 100
+```
+
+*Note:* Heuristic lure-keyword/impersonation detection — tune `LureTerms` and sender allow-lists for your region/sector (e.g., Taiwan research orgs); high FP risk without recipient-domain scoping.
+
+#### Possible AitM session hijack following Google login page click
+- **Actor / Campaign:** UAT-11985
+- **MITRE ATT&CK:** T1557 — Adversary-in-the-Middle
+- **Data source:** UrlClickEvents, AADSignInEventsBeta
+- **Source:** [1]
+
+```kql
+let clicks = UrlClickEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ClickAllowed"
+| where Url has_any ("accounts.google.com","google.com") // AitM proxy mimics Google auth flow
+| project ClickTime = Timestamp, AccountUpn, Url;
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ResultType == 0
+| join kind=inner clicks on AccountUpn
+| where Timestamp between (ClickTime .. ClickTime + 15m)
+| project ClickTime, SignInTime = Timestamp, AccountUpn, Url, IPAddress, Location, AppDisplayName, UserAgent
+| take 100
+```
+
+*Note:* Flags fast sign-in events immediately after a user clicks a Google-domain link — a pattern consistent with real-time AitM relay/token theft. Requires tuning for legitimate SSO redirect flows; correlate with new/anomalous IP or ASN for higher fidelity.
+
+#### npm tensorlake (Shai-Hulud/ChainDrop) worm install behavior
+- **Actor / Campaign:** Shai-Hulud / ChainDrop supply-chain worm
+- **MITRE ATT&CK:** T1195.002 — Supply Chain Compromise: Compromise Software Supply Chain
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("npm.cmd","npm","node.exe","node")
+| where FileName in~ ("cmd.exe","powershell.exe","bash","sh","curl.exe","wget")
+| where ProcessCommandLine has_any ("tensorlake","0.5.144","postinstall")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessCommandLine, ProcessCommandLine, FolderPath
+| take 100
+```
+
+*Note:* No file hashes were published; this looks for the known package name/version string and the install→shell-spawn pattern typical of Shai-Hulud postinstall payloads. Pair with checks for access to `~/.npmrc`, `~/.aws/credentials`, `~/.ssh` shortly after npm installs.
+
+#### Suspicious persistence/download chain from npm-spawned processes (MALFEX/Overlord)
+- **Actor / Campaign:** MALFEX (lone actor, per CloudSEK/Checkmarx)
+- **MITRE ATT&CK:** T1059 — Command and Scripting Interpreter; T1195.002 — Supply Chain Compromise
+- **Data source:** DeviceProcessEvents, DeviceRegistryEvents
+- **Source:** [6]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("npm","npm.cmd","node.exe")
+| where FileName in~ ("powershell.exe","wscript.exe","mshta.exe","rundll32.exe")
+| where ProcessCommandLine has_any ("-enc","downloadstring","iex","http://","https://")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessCommandLine, ProcessCommandLine
+| take 100
+| union (
+    DeviceRegistryEvents
+    | where Timestamp > ago(14d)
+    | where RegistryKey has @"\Software\Microsoft\Windows\CurrentVersion\Run"
+    | where InitiatingProcessFileName in~ ("node.exe","npm.cmd")
+    | project Timestamp, DeviceName, RegistryKey, RegistryValueName, RegistryValueData
+    | take 100
+)
+```
+
+*Note:* No specific package names/hashes were given in the summary; this hunts for the generic npm-install → LOLBin/encoded-command → persistence chain described for RAT/stealer delivery (40K+ downloads across 8 packages). Expect tuning for legitimate build tooling that uses PowerShell from Node scripts.
+
+#### MSIX attachment delivery / App Installer protocol abuse
+- **Actor / Campaign:** unattributed (abuse pattern behind Microsoft's Outlook MSIX block)
+- **MITRE ATT&CK:** T1204.002 — User Execution: Malicious File
+- **Data source:** EmailAttachmentInfo, DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+EmailAttachmentInfo
+| where Timestamp > ago(7d)
+| where FileName endswith ".msix" or FileName endswith ".msixbundle"
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, FileName, NetworkMessageId
+| take 100
+```
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "AppInstaller.exe"
+| where ProcessCommandLine has "ms-appinstaller"
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+*Note:* MSIX/App Installer abuse (ms-appinstaller:// protocol) has been used in prior malware campaigns, prompting Microsoft's November attachment block; use both queries to find residual exposure (inbound MSIX mail) and execution attempts pre-rollout.
+
+#### Cryptomining payloads/commands on exposed AI inference servers (PoeLLM)
+- **Actor / Campaign:** PoeLLM cryptomining campaign
+- **MITRE ATT&CK:** T1496 — Resource Hijacking; T1210 — Exploitation of Remote Services
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [9]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any ("xmrig","stratum+tcp","poellm","minerd","--donate-level")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+| take 100
+```
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort in (3333,4444,5555,7777,14444,14433) // common XMR/stratum mining pool ports
+| where InitiatingProcessFileName has_any ("ollama","python","python3","java") // AI-server-adjacent process names, tune to your stack
+| project Timestamp, DeviceName, InitiatingProcessFileName, RemoteIP, RemotePort, RemoteUrl
+| take 100
+```
+
+*Note:* No file hashes/C2 domains published; hunts for mining-tool indicators and stratum-protocol ports originating from processes typical of AI/LLM server stacks (Ollama, vLLM, etc.) exposed to the internet. Expect FPs on legitimate GPU/crypto research hosts — validate against known-exposed AI service inventory.
+
+#### Exploitation attempts against Atlassian Data Center arbitrary file access flaw
+- **Actor / Campaign:** unattributed, mass-exploitation of CVE-2026-21589
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents (webshell/child-process indicators), AzureDiagnostics / web access logs (tune to your ingested proxy/WAF table)
+- **Source:** [10]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(3d)
+| where InitiatingProcessFileName in~ ("java.exe","javaw.exe","catalina.sh")
+| where FileName in~ ("cmd.exe","powershell.exe","sh","bash")
+| where InitiatingProcessFolderPath has_any ("confluence","jira","bitbucket")
+| project Timestamp, DeviceName, InitiatingProcessFolderPath, InitiatingProcessCommandLine, ProcessCommandLine
+| take 100
+```
+
+```kql
+// Tune Category/table to your WAF/reverse-proxy log ingestion
+AzureDiagnostics
+| where TimeGenerated > ago(3d)
+| where Category has "AccessLog"
+| where requestUri_s has_any ("/rest/api","/plugins/servlet","/s/","/download") and requestUri_s has "../"
+| project TimeGenerated, clientIP_s, requestUri_s, httpStatus_d, userAgent_s
+| take 100
+```
+
+*Note:* CVE-2026-21589 exploitation began within two hours of disclosure per reporting; the process-chain query flags post-exploitation command execution from Confluence/Jira/Bitbucket Java processes, while the web-log query is a generic path-traversal heuristic requiring adaptation to your actual ingress logging source.
+
+#### Cloud instance metadata (IMDS) queries from suspicious OSS package processes (Web3 supply chain)
+- **Actor / Campaign:** unattributed (Web3-themed cloud supply chain attacks, per Unit 42)
+- **MITRE ATT&CK:** T1552.005 — Unsecured Credentials: Cloud Instance Metadata API; T1195.002 — Supply Chain Compromise
+- **Data source:** DeviceNetworkEvents
+- **Source:** [5]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemoteIP == "169.254.169.254" // cloud IMDS endpoint
+| where InitiatingProcessFileName in~ ("node.exe","npm.cmd","python.exe","pip.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl
+| take 100
+```
+
+*Note:* Behavioral hunt for OSS-package processes (npm/pip-installed) querying cloud metadata services to steal instance credentials, a technique Unit 42 associates with Web3/cloud supply-chain attacks; expect legitimate SDKs (AWS/GCP client libraries) to also hit IMDS, so cross-reference with known-malicious package names when available.
+
+> [1] UAT-11985: AI-assisted event lures delivering real-time Google AitM phishing — https://blog.talosintelligence.com/uat-11985/
+> [4] Tensorlake npm Package Compromised to Deliver Shai-Hulud Credential-Stealing Worm — https://thehackernews.com/2026/10/tensorlake-npm-package-compromised-to.html
+> [5] Evolution of Web3 in Cloud Supply Chain Attacks — https://unit42.paloaltonetworks.com/web3-cloud-supply-chain-attacks/
+> [6] Eight Malicious npm Packages Downloaded 40,767 Times Deliver Overlord RAT and Stealer — https://thehackernews.com/2026/10/eight-malicious-npm-packages-downloaded.html
+> [8] Microsoft Outlook to block MSIX attachments starting November — https://www.bleepingcomputer.com/news/microsoft/microsoft-outlook-to-block-msix-attachments-used-in-attacks/
+> [9] PoeLLM malware infects exposed AI servers in cryptomining attacks — https://www.bleepingcomputer.com/news/security/poellm-malware-infects-exposed-ai-servers-in-cryptomining-attacks/
+> [10] Atlassian Data Center Flaw Draws Exploitation Attempts Within Two Hours of Public Details — https://thehackernews.com/2026/10/atlassian-data-center-flaw-draws.html
