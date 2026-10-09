@@ -9810,3 +9810,157 @@ DeviceNetworkEvents
 > [8] Microsoft Outlook to block MSIX attachments starting November — https://www.bleepingcomputer.com/news/microsoft/microsoft-outlook-to-block-msix-attachments-used-in-attacks/
 > [9] PoeLLM malware infects exposed AI servers in cryptomining attacks — https://www.bleepingcomputer.com/news/security/poellm-malware-infects-exposed-ai-servers-in-cryptomining-attacks/
 > [10] Atlassian Data Center Flaw Draws Exploitation Attempts Within Two Hours of Public Details — https://thehackernews.com/2026/10/atlassian-data-center-flaw-draws.html
+
+### 2026-10-09
+
+*Generated 2026-10-09 13:33 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### ProFTPD mod_copy Post-Exploitation Shell Spawn (CVE-2015-3306)
+- **Actor / Campaign:** Flax Typhoon
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [1][8][15]
+
+```kql
+// Detects shells/tools spawned by proftpd after SITE CPFR/CPTO abuse (CVE-2015-3306)
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("proftpd", "in.proftpd")
+| where FileName in~ ("sh","bash","dash","nc","ncat","python","python3","perl","wget","curl")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* ProFTPD exploitation occurs at the FTP protocol layer and is not directly visible in EDR telemetry; this looks for the common post-exploit pattern of the FTP daemon spawning a shell/utility, which should essentially never happen legitimately. Tune process names to your environment's FTP daemon binary.
+
+#### Apache Struts Dynamic Method Invocation Command Injection → Shell Spawn (CVE-2016-3081)
+- **Actor / Campaign:** Flax Typhoon
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [1][8][12]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("java.exe","java","httpd","tomcat","tomcat9","catalina.sh")
+| where FileName in~ ("cmd.exe","powershell.exe","sh","bash","wget","curl","nc","ncat")
+| where ProcessCommandLine has_any ("whoami","id ","wget ","curl ","/bin/sh","cmd /c")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Java/Tomcat/httpd rarely spawn shells under normal operation; validate against known app-server automation (deploy scripts) before alerting. Adjust parent process names for Struts hosting (e.g., WebLogic, JBoss).
+
+#### ONLYOFFICE Docs Path Traversal File Write Outside Expected Directory (CVE-2021-3199)
+- **Actor / Campaign:** Flax Typhoon
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceFileEvents
+- **Source:** [1][8][14]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has_any ("docservice","onlyoffice","ds-converter")
+| where FolderPath has ".." or FolderPath !startswith "/var/www/onlyoffice"  // adjust to actual install path
+| project Timestamp, DeviceName, InitiatingProcessFileName, FolderPath, FileName, RequestAccountName
+| take 100
+```
+
+*Note:* Heuristic — relies on EDR file-path visibility and requires the baseline install path to be updated for your environment; web/application logs from the ONLYOFFICE service itself will give higher-fidelity results.
+
+#### Exchange/OWA Password Spraying Pattern
+- **Actor / Campaign:** Chinese government-linked actors (Integrity Technology Group enabled)
+- **MITRE ATT&CK:** T1110.003 — Password Spraying
+- **Data source:** SigninLogs
+- **Source:** [8]
+
+```kql
+SigninLogs
+| where TimeGenerated > ago(1d)
+| where ResultType in ("50126","50053","50057")
+| summarize FailedAccounts = dcount(UserPrincipalName), Attempts = count() by IPAddress, bin(TimeGenerated, 1h)
+| where FailedAccounts > 15 and Attempts > 30
+| order by Attempts desc
+```
+
+*Note:* Tune thresholds to your tenant's size and normal failure baseline; this is behavioral and not limited to Exchange — pair with on-prem OWA/ADFS logs (CommonSecurityLog/Syslog) where SigninLogs doesn't apply to legacy Exchange auth.
+
+#### Suspected Mailbox / Credential Export Script Execution
+- **Actor / Campaign:** Chinese government-linked actors (Integrity Technology Group enabled)
+- **MITRE ATT&CK:** T1114.001 — Email Collection: Local Email Collection; T1003 — OS Credential Dumping
+- **Data source:** DeviceProcessEvents
+- **Source:** [8]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessCommandLine has_any ("New-MailboxExportRequest","Export-Mailbox","Get-MailboxExportRequest")
+   or (FileName in~ ("powershell.exe","pwsh.exe") and ProcessCommandLine has_any ("ExchangePowerShell","New-ManagementRoleAssignment"))
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Legitimate Exchange admin mailbox exports will trigger this; cross-reference with change-management tickets and source account normalcy (is the account a known Exchange admin, is the source host the expected management server).
+
+#### Unexpected VPN Client Installation for Persistence
+- **Actor / Campaign:** Chinese government-linked actors (Integrity Technology Group enabled)
+- **MITRE ATT&CK:** T1133 — External Remote Services
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [8]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName has_any ("openvpn","wireguard","softether","anydesk")
+| where InitiatingProcessAccountName !endswith "$"  // exclude machine/service accounts, adjust as needed
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessAccountName
+| take 100
+```
+
+*Note:* Highly environment-dependent; build an allowlist of sanctioned VPN tooling first to reduce noise, as several of these tools have legitimate enterprise use.
+
+#### HTML Smuggling / mshta-to-Script Chain (Possible ASHVEIN Delivery)
+- **Actor / Campaign:** UAC-0099 / Earth Sirrush — ASHVEIN RAT
+- **MITRE ATT&CK:** T1027.006 — Obfuscated Files or Information: HTML Smuggling; T1059.005 — Visual Basic
+- **Data source:** DeviceProcessEvents
+- **Source:** [5]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "mshta.exe"
+| where FileName in~ ("powershell.exe","cmd.exe","wscript.exe","cscript.exe")
+| project Timestamp, DeviceName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* No file hashes/domains were published for ASHVEIN in this reporting, so this is behavior-based on its reported technique (commands hidden in HTML, executed via mshta-style chains). Expect some noise from legacy enterprise apps still using HTA/mshta; validate against Ukrainian government or related sector targeting context.
+
+#### Suspicious Email Link Click to Google-Branded AitM Phishing Page
+- **Actor / Campaign:** UAT-11985
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link; T1557 — Adversary-in-the-Middle
+- **Data source:** EmailEvents, UrlClickEvents
+- **Source:** [9]
+
+```kql
+UrlClickEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ClickAllowed"
+| where Url has_any ("accounts.google", "google.com")
+| join kind=inner (EmailEvents) on NetworkMessageId
+| where SenderFromDomain !has "google.com"
+| project Timestamp, AccountUpn, Url, SenderFromAddress, Subject
+| take 100
+```
+
+*Note:* No concrete lure domains/hashes were published; this is a coarse heuristic looking for Google-branded links sent from non-Google sending domains (a hallmark of AitM phishing proxying Google login pages) and will need tightening (e.g., add Safe Links verdict, recipient scoping to research/policy-sector users, and exclusion of legitimate third-party Google-auth integrations) to cut false positives.
+
+> [1] Flax Typhoon Exploits Five Flaws as CISA Sets October 11 Deadline for Federal Agencies — https://thehackernews.com/2026/10/flax-typhoon-exploits-five-flaws-as.html
+> [5] UAC-0099 Targets Ukrainian Government Personnel With ASHVEIN RAT Hiding Commands in HTML — https://thehackernews.com/2026/10/uac-0099-targets-ukrainian-government.html
+> [8] Chinese Government-linked Cyber Threat Actors Combine Automated and Hands-on Hacking Tools to Steal Sensitive Data — https://www.cisa.gov/news-events/cybersecurity-advisories/aa26-281a
+> [9] UAT-11985: AI-assisted event lures delivering real-time Google AitM phishing — https://blog.talosintelligence.com/uat-11985/
+> [12] CVE-2016-3081 — Apache Struts: Apache Struts Command Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2016-3081
+> [14] CVE-2021-3199 — ONLYOFFICE Docs: ONLYOFFICE Docs Server Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2021-3199
+> [15] CVE-2015-3306 — ProFTPD ProFTPD: ProFTPD Improper Access Control Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2015-3306
