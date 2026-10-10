@@ -9964,3 +9964,119 @@ UrlClickEvents
 > [12] CVE-2016-3081 — Apache Struts: Apache Struts Command Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2016-3081
 > [14] CVE-2021-3199 — ONLYOFFICE Docs: ONLYOFFICE Docs Server Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2021-3199
 > [15] CVE-2015-3306 — ProFTPD ProFTPD: ProFTPD Improper Access Control Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2015-3306
+
+### 2026-10-10
+
+*Generated 2026-10-10 13:26 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### AhsayCBS Web Server Process Spawning Shell (Exploitation of CVE-2026-105133 & companion flaw)
+- **Actor / Campaign:** Unattributed (opportunistic exploitation of AhsayCBS)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [1][4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("java.exe","javaw.exe","tomcat9.exe")
+| where InitiatingProcessFolderPath has_any ("ahsaycbs", "AhsayOBS", "tomcat")
+| where FileName in~ ("cmd.exe","powershell.exe","powershell_ise.exe","sh","bash","wget","curl")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* AhsayCBS runs on a Java/Tomcat stack; the backup service process should not normally spawn a shell or downloader. Validate folder paths match your Ahsay install location before deploying broadly.
+
+#### Webshell File Drop in AhsayCBS / Tomcat Webapps Directory
+- **Actor / Campaign:** Unattributed (AhsayCBS webshell deployment)
+- **MITRE ATT&CK:** T1505.003 — Server Software Component: Web Shell
+- **Data source:** DeviceFileEvents
+- **Source:** [1][4]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any ("ahsaycbs", "AhsayOBS", "webapps")
+| where FileName endswith ".jsp" or FileName endswith ".jspx" or FileName endswith ".war"
+| where InitiatingProcessFileName in~ ("java.exe","javaw.exe","tomcat9.exe")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, SHA256, RequestAccountName
+| take 100
+```
+
+*Note:* Legitimate Ahsay updates could occasionally drop .jsp/.war files; cross-check file hash/age against known-good installer artifacts before escalating.
+
+#### XMRig Miner Masquerading as Microsoft Edge (msedge.exe)
+- **Actor / Campaign:** Unattributed (AhsayCBS post-exploitation cryptomining)
+- **MITRE ATT&CK:** T1036.005 — Masquerading: Match Legitimate Name or Location; T1496 — Resource Hijacking
+- **Data source:** DeviceProcessEvents
+- **Source:** [4]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "msedge.exe"
+| where FolderPath !has @"\Program Files\Microsoft\Edge" and FolderPath !has @"\Program Files (x86)\Microsoft\Edge"
+| where ProcessCommandLine has_any ("--donate", "stratum+tcp", "xmrig", "--cpu-priority", "-o pool", "--algo")
+| project Timestamp, DeviceName, FolderPath, ProcessCommandLine, InitiatingProcessFileName, AccountName
+| take 100
+```
+
+*Note:* Key indicator is an "msedge.exe" running outside the standard Edge install path with mining-related command-line flags; tune path exclusions to your environment's legitimate Edge deployment (e.g., per-user installs).
+
+#### Network Connections Consistent with XMRig Mining Pools from Backup/Edge Processes
+- **Actor / Campaign:** Unattributed (AhsayCBS cryptomining campaign)
+- **MITRE ATT&CK:** T1496 — Resource Hijacking; T1071 — Application Layer Protocol
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1][4]
+
+```kql
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemotePort in (3333, 4444, 5555, 7777, 8080, 14444, 14433)
+| where InitiatingProcessFileName =~ "msedge.exe" or InitiatingProcessFolderPath has_any ("ahsaycbs", "AhsayOBS")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, RemoteIP, RemoteUrl, RemotePort
+| take 100
+```
+
+*Note:* Stratum mining ports are heuristic and widely reused by non-mining services; pivot on process context (Edge/Ahsay) rather than port alone to reduce noise.
+
+#### ProFTPD Process Spawning Shell/Downloader (CVE-2015-3306, Flax Typhoon KEV Addition)
+- **Actor / Campaign:** Flax Typhoon
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents
+- **Source:** [5]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName has "proftpd" or InitiatingProcessFolderPath has "proftpd"
+| where FileName in~ ("sh","bash","cmd.exe","nc","ncat","wget","curl","perl","python")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* CVE-2015-3306 is an unauthenticated file-copy flaw in ProFTPD used for arbitrary file read/write — a shell spawned directly from the ProFTPD process is a strong compromise indicator. Confirm your environment runs ProFTPD and is unpatched/exposed before relying on this as high confidence.
+
+#### Reconnaissance Command Burst from Web Server / Application Process (Generic Flax Typhoon Post-Exploit Pattern)
+- **Actor / Campaign:** Flax Typhoon
+- **MITRE ATT&CK:** T1059 — Command and Scripting Interpreter; T1082/T1087 — System/Account Discovery
+- **Data source:** DeviceProcessEvents
+- **Source:** [5]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("w3wp.exe","httpd.exe","nginx.exe","tomcat9.exe","java.exe","proftpd")
+| where FileName in~ ("whoami.exe","net.exe","net1.exe","ipconfig.exe","systeminfo.exe","tasklist.exe","hostname.exe")
+| summarize CmdCount = count(), Commands = make_set(FileName) by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+| where CmdCount >= 3
+| take 100
+```
+
+*Note:* This is behavioral/TTP-based (no specific IOCs were disclosed for the five newly-KEV-listed CVEs beyond CVE-2015-3306); it targets the discovery-command burst pattern typically seen after a public-facing app is exploited and a webshell is used, consistent with Flax Typhoon's historical tradecraft. Expect false positives from legitimate admin scripts/monitoring agents — tune by excluding known management tooling.
+
+> [1] Unpatched AhsayCBS flaws exploited to deploy webshells, mine crypto — https://www.bleepingcomputer.com/news/security/unpatched-ahsaycbs-flaws-exploited-to-deploy-webshells-mine-crypto/
+> [4] Attackers Exploit AhsayCBS Flaws to Deploy XMRig Miners Disguised as Microsoft Edge — https://thehackernews.com/2026/10/attackers-exploit-ahsaycbs-flaws-to.html
+> [5] Flax Typhoon Exploits Five Flaws as CISA Sets October 11 Deadline for Federal Agencies — https://thehackernews.com/2026/10/flax-typhoon-exploits-five-flaws-as.html
