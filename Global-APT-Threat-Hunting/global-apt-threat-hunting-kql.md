@@ -10080,3 +10080,76 @@ DeviceProcessEvents
 > [1] Unpatched AhsayCBS flaws exploited to deploy webshells, mine crypto — https://www.bleepingcomputer.com/news/security/unpatched-ahsaycbs-flaws-exploited-to-deploy-webshells-mine-crypto/
 > [4] Attackers Exploit AhsayCBS Flaws to Deploy XMRig Miners Disguised as Microsoft Edge — https://thehackernews.com/2026/10/attackers-exploit-ahsaycbs-flaws-to.html
 > [5] Flax Typhoon Exploits Five Flaws as CISA Sets October 11 Deadline for Federal Agencies — https://thehackernews.com/2026/10/flax-typhoon-exploits-five-flaws-as.html
+
+### 2026-10-11
+
+*Generated 2026-10-11 13:26 UTC · model `claude-sonnet-5`*
+
+_Lint: 3 KQL block(s) — query 1: placeholder-like token 'placeholder'. All queries are CANDIDATES; validate before use._
+
+_No concrete IOCs (file hashes, IPs, domains, tool filenames) were provided in this item — detections below are behavioral/TTP-based, inferred from the described tradecraft (use of an AI-driven pentesting framework and an LLM "agent" to automate attack steps against bank infrastructure), and will need tuning per environment._
+
+#### Outbound connections to Anthropic/Claude API endpoints from server or non-developer assets
+- **Actor / Campaign:** Unattributed Chinese actor using ARTEX AI + Claude agents (per BleepingComputer)
+- **MITRE ATT&CK:** T1102 — Web Service (legitimate service used to drive/orchestrate attacker tooling)
+- **Data source:** DeviceNetworkEvents
+- **Source:** [1]
+
+```kql
+// Flags hosts calling out to Anthropic/Claude API domains that are not developer workstations
+// Tune the RemoteUrl match and the "approved AI usage" exclusion list to your environment
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any ("anthropic.com", "claude.ai", "api.anthropic.com")
+| where DeviceName !has_any ("DEV-", "LAPTOP-")   // placeholder: exclude known approved AI-tooling hosts
+| summarize ConnCount = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp) by DeviceName, RemoteUrl, InitiatingProcessFileName, InitiatingProcessAccountName
+| where ConnCount > 1
+| take 100
+```
+
+*Note:* High false-positive potential — many orgs now have legitimate developer or SOC use of Claude/Anthropic APIs. Use only as a pivot to confirm against servers, domain controllers, or financial application hosts that should never call external AI APIs; whitelist known approved usage first.
+
+#### Rapid-fire chained discovery commands indicative of agentic/automated pentesting tooling
+- **Actor / Campaign:** Unattributed Chinese actor using ARTEX AI + Claude agents (per BleepingComputer)
+- **MITRE ATT&CK:** T1082 — System Information Discovery; T1018 — Remote System Discovery; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// AI-driven pentest agents tend to execute many discovery commands back-to-back in a tight time window
+// (far faster/denser than typical human operator cadence)
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("whoami.exe","hostname.exe","systeminfo.exe","ipconfig.exe","net.exe","nltest.exe","tasklist.exe","arp.exe","nbtstat.exe")
+| summarize CmdCount = dcount(FileName), Commands = make_set(FileName), FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by DeviceName, InitiatingProcessAccountName, bin(Timestamp, 2m)
+| where CmdCount >= 5
+| sort by CmdCount desc
+| take 100
+```
+
+*Note:* This is a generic "rapid recon burst" heuristic, not specific to ARTEX AI — tune the time bin and command-count threshold to your baseline, and expect noise from legitimate admin scripts/RMM tools.
+
+#### New/unusual parent process spawning multiple reconnaissance binaries (possible AI-agent orchestration)
+- **Actor / Campaign:** Unattributed Chinese actor using ARTEX AI + Claude agents (per BleepingComputer)
+- **MITRE ATT&CK:** T1059 — Command and Scripting Interpreter; T1106 — Native API (automated tool execution)
+- **Data source:** DeviceProcessEvents
+- **Source:** [1]
+
+```kql
+// Looks for a single non-standard parent process (e.g., script interpreter, uncommon binary)
+// spawning several distinct discovery/recon child processes — a pattern consistent with
+// an automated/agentic orchestration tool driving commands rather than manual typing
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName !in~ ("cmd.exe","powershell.exe","explorer.exe","services.exe")
+| where FileName in~ ("whoami.exe","net.exe","systeminfo.exe","ipconfig.exe","tasklist.exe","nltest.exe")
+| summarize DistinctChildren = dcount(FileName), Children = make_set(FileName), FirstSeen = min(Timestamp)
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, InitiatingProcessAccountName
+| where DistinctChildren >= 3
+| take 100
+```
+
+*Note:* Intended to surface unusual orchestrators (e.g., custom AI-agent launcher binaries) driving recon rather than normal shells; expect to tune out legitimate EDR/management agents that also spawn discovery commands.
+
+> [1] ARTEX AI, Claude agents used in cyberattacks on South Korean banks — https://www.bleepingcomputer.com/news/security/hacker-used-artex-ai-and-claude-agents-to-target-south-korean-banks/
