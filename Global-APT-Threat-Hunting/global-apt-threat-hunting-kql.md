@@ -10153,3 +10153,130 @@ DeviceProcessEvents
 *Note:* Intended to surface unusual orchestrators (e.g., custom AI-agent launcher binaries) driving recon rather than normal shells; expect to tune out legitimate EDR/management agents that also spawn discovery commands.
 
 > [1] ARTEX AI, Claude agents used in cyberattacks on South Korean banks — https://www.bleepingcomputer.com/news/security/hacker-used-artex-ai-and-claude-agents-to-target-south-korean-banks/
+
+### 2026-10-12
+
+*Generated 2026-10-12 13:48 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### Unauthorized/unexpected USB composite device enumeration on crypto-wallet hosts
+- **Actor / Campaign:** unattributed (Ledger/CryptoBilis hardware implant reports)
+- **MITRE ATT&CK:** T1200 — Hardware Additions
+- **Data source:** DeviceEvents
+- **Source:** [1]
+
+```kql
+// No concrete IOCs were published for the implanted Ledger devices; this is a behavioral
+// heuristic to spot newly-attached USB/HID composite devices on endpoints used for
+// crypto wallet management, which could indicate a tampered hardware wallet or implant.
+DeviceEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("UsbDeviceMounted", "PnpDeviceConnected", "DeviceComplianceStateChanged")
+| where AdditionalFields has_any ("HID", "Composite", "Ledger", "Vendor")
+| project Timestamp, DeviceName, ActionType, AdditionalFields
+| take 100
+```
+
+*Note:* High false-positive rate — most USB device connect events are benign. Tune by scoping to hosts known to be used for cryptocurrency operations and by correlating with subsequent unusual outbound traffic from crypto wallet software (e.g., Ledger Live) shortly after device attach.
+
+#### SonicWall SMA 1000 SSRF exploitation attempts (CVE-2026-102255)
+- **Actor / Campaign:** unattributed, opportunistic mass exploitation
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (SonicWall syslog ingestion)
+- **Source:** [2]
+
+```kql
+// Pre-auth SSRF (CVE-2026-102255, CVSS 10.0) lets an attacker make the SMA 1000 appliance
+// issue requests on its behalf. Hunt for requests targeting internal/metadata-style
+// addresses or management endpoints shortly after the patch window.
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor == "SonicWall"
+| where DeviceProduct has_any ("SMA", "Secure Mobile Access")
+| where RequestURL has_any ("169.254.169.254", "127.0.0.1", "localhost", "/cgi-bin/", "admin")
+    or Message has_any ("SSRF", "server-side request forgery")
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, RequestURL, Message
+| take 100
+```
+
+*Note:* Requires SonicWall logs forwarded to Sentinel (CommonSecurityLog/CEF connector); field names may need adjustment to your parser. Expect tuning to filter legitimate health-check/admin traffic.
+
+#### Anomalous outbound activity from SonicWall SMA appliance IP post-exploitation
+- **Actor / Campaign:** unattributed, mass exploitation of CVE-2026-102255
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1133 — External Remote Services
+- **Data source:** CommonSecurityLog, SigninLogs / IdentityLogonEvents
+- **Source:** [2]
+
+```kql
+// After successful SSRF-based compromise, look for new or anomalous authenticated
+// sessions originating from the SMA appliance's management/public IP shortly after
+// disclosure (2026-10). Adjust KnownApplianceIP to your environment.
+let KnownApplianceIP = dynamic([]); // populate with your SMA 1000 public/management IPs
+SigninLogs
+| where TimeGenerated > ago(14d)
+| where IPAddress in (KnownApplianceIP)
+| summarize count(), distinct_UPNs = dcount(UserPrincipalName) by IPAddress, bin(TimeGenerated, 1h)
+| where distinct_UPNs > 1
+| take 100
+```
+
+*Note:* Needs the appliance's own IP(s) populated; intended to catch abnormal lateral authentication bursts following exploitation rather than the exploit itself.
+
+#### Web server process spawning script interpreters/shells (potential web shell to Cobalt Strike)
+- **Actor / Campaign:** CyberXero (AI-orchestrated campaign against Ukraine)
+- **MITRE ATT&CK:** T1505.003 — Web Shell; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("w3wp.exe","php-cgi.exe","php.exe","httpd.exe","nginx.exe","apache2.exe")
+| where FileName in~ ("cmd.exe","powershell.exe","powershell_ise.exe","cscript.exe","wscript.exe","rundll32.exe","mshta.exe","certutil.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, InitiatingProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Common pattern for WordPress/e-commerce compromise leading to Cobalt Strike deployment described in the report; expect some noise from legitimate CMS plugins/cron tasks — tune by excluding known maintenance scripts.
+
+#### Cobalt Strike-style rundll32/argument-less process execution
+- **Actor / Campaign:** CyberXero
+- **MITRE ATT&CK:** T1055 — Process Injection; T1218.011 — Rundll32
+- **Data source:** DeviceProcessEvents
+- **Source:** [3]
+
+```kql
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "rundll32.exe"
+| where isempty(ProcessCommandLine) or ProcessCommandLine =~ "rundll32.exe"
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* Classic Cobalt Strike beacon loader artifact (rundll32 executed with no/blank arguments); validate against baseline since some legitimate shell extensions can also invoke rundll32 without visible args.
+
+#### Unexpected egress to Anthropic Claude API from server/web infrastructure
+- **Actor / Campaign:** CyberXero (AI-orchestration layer via Claude Code)
+- **MITRE ATT&CK:** T1583.008 — Acquire Infrastructure: Malvertising/AI Tooling (closest: T1071 — Application Layer Protocol); T1588.002 — Tool
+- **Data source:** DeviceNetworkEvents
+- **Source:** [3]
+
+```kql
+// Flags servers/workloads (not expected to run developer AI tooling) reaching Anthropic's
+// Claude API, consistent with CyberXero's AI-orchestration layer used for intrusion
+// automation.
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any ("anthropic.com", "api.anthropic.com")
+| where DeviceName has_any ("web", "wp", "iis", "srv") // adjust to your server naming convention
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl, RemoteIP, RemotePort
+| take 100
+```
+
+*Note:* Legitimate developer use of Claude Code will cause false positives on workstations; scope this query to production/server assets where AI API calls are unexpected, and correlate with the web-shell/Cobalt Strike detections above.
+
+> [1] Ledger Finds Unauthorized Hardware Implant in CryptoBilis-Sold Wallet Amid Fund Theft Reports — https://thehackernews.com/2026/10/ledger-finds-unauthorized-hardware.html
+> [2] Critical SonicWall SMA 1000 Flaw Targeted in 135 Exploitation Attempts After Patch — https://thehackernews.com/2026/10/critical-sonicwall-sma-1000-flaw.html
+> [3] CyberXero Uses Claude Code in Campaign That Stole Over 628,000 Ukrainian Records — https://thehackernews.com/2026/10/cyberxero-uses-claude-code-in-campaign.html
