@@ -10280,3 +10280,121 @@ DeviceNetworkEvents
 > [1] Ledger Finds Unauthorized Hardware Implant in CryptoBilis-Sold Wallet Amid Fund Theft Reports — https://thehackernews.com/2026/10/ledger-finds-unauthorized-hardware.html
 > [2] Critical SonicWall SMA 1000 Flaw Targeted in 135 Exploitation Attempts After Patch — https://thehackernews.com/2026/10/critical-sonicwall-sma-1000-flaw.html
 > [3] CyberXero Uses Claude Code in Campaign That Stole Over 628,000 Ukrainian Records — https://thehackernews.com/2026/10/cyberxero-uses-claude-code-in-campaign.html
+
+### 2026-10-13
+
+*Generated 2026-10-13 13:38 UTC · model `claude-sonnet-5`*
+
+_Lint: 5 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### SonicWall SMA 1000 Pre-Auth SSRF Exploitation Attempt (CVE-2026-102255)
+- **Actor / Campaign:** unattributed — mass opportunistic exploitation
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog
+- **Source:** [6]
+
+```kql
+// Requires SonicWall SMA syslog/CEF forwarding into CommonSecurityLog
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor has "SonicWall"
+| where DeviceProduct has_any ("SMA", "Secure Mobile Access")
+// SSRF exploitation commonly manifests as requests with embedded URLs/internal IPs in parameters
+| where RequestURL has_any ("http://", "https://", "169.254.", "127.0.0.1", "localhost")
+    or AdditionalExtensions has_any ("ssrf", "redirect")
+| summarize AttemptCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+    by SourceIP, DestinationIP, DestinationPort, RequestURL
+| where AttemptCount >= 1
+| sort by AttemptCount desc
+| take 100
+```
+
+*Note:* Exact CVE-2026-102255 request signature wasn't published in the source; this heuristic flags SSRF-style parameter patterns against SonicWall SMA 1000 and will need tuning to your actual CEF field mapping and known-good admin URLs to cut false positives. Patch urgency is high given CVSS 10.0 and 135 observed attempts within days of disclosure [6].
+
+#### SonicWall SMA Appliance Issuing Anomalous Outbound Requests (Post-SSRF Callback)
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1190, T1210 — Exploitation of Remote Services
+- **Data source:** CommonSecurityLog, DeviceNetworkEvents (if appliance egress is logged via network telemetry/firewall)
+- **Source:** [6]
+
+```kql
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor has "SonicWall"
+| where Activity has_any ("Connection", "Outbound", "Request")
+| where SourceIP in ((CommonSecurityLog
+    | where DeviceVendor has "SonicWall"
+    | distinct SourceIP))
+// Look for the SMA appliance itself initiating connections to internal management ranges or unfamiliar external IPs
+| where DestinationIP !startswith "10." and DestinationIP !startswith "192.168." and DestinationIP !startswith "172.16."
+| summarize ConnCount = count() by SourceIP, DestinationIP, DestinationPort, bin(TimeGenerated, 1h)
+| where ConnCount > 20
+| take 100
+```
+
+*Note:* SSRF on SMA 1000 lets the appliance be coerced into issuing attacker-directed requests; this is a coarse beaconing heuristic and needs environment-specific baselining of normal SMA egress destinations. Pair with vendor patch/IOC updates as they emerge [6].
+
+#### Ledger Live Process Spawning Unexpected Child Processes (Supply-Chain Hardware Implant Follow-on)
+- **Actor / Campaign:** unattributed — CryptoBilis hardware implant campaign
+- **MITRE ATT&CK:** T1195.003 — Supply Chain Compromise: Hardware Supply Chain; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [3],[5]
+
+```kql
+DeviceProcessEvents
+| where TimeGenerated > ago(14d)
+| where InitiatingProcessFileName has_any ("ledger-live.exe", "LedgerLive.exe")
+| where FileName has_any ("cmd.exe", "powershell.exe", "wscript.exe", "mshta.exe", "rundll32.exe")
+| project TimeGenerated, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Ledger confirmed a hardware implant on devices sold through reseller CryptoBilis draining wallets [3][5]; no malware filenames/hashes were disclosed, so this looks for a generic suspicious-child-process pattern from the legitimate Ledger Live app and will need baselining against normal installer/update behavior.
+
+#### Ledger Live Network Connections to Rarely-Seen External Hosts
+- **Actor / Campaign:** unattributed — CryptoBilis hardware implant campaign
+- **MITRE ATT&CK:** T1195.003 — Supply Chain Compromise: Hardware Supply Chain; T1071 — Application Layer Protocol
+- **Data source:** DeviceNetworkEvents
+- **Source:** [3],[5]
+
+```kql
+DeviceNetworkEvents
+| where TimeGenerated > ago(14d)
+| where InitiatingProcessFileName has_any ("ledger-live.exe", "LedgerLive.exe")
+| where RemoteIPType == "Public"
+| summarize ConnCount = count(), FirstSeen = min(TimeGenerated) by DeviceName, RemoteIP, RemoteUrl, InitiatingProcessFileName
+| where ConnCount < 5  // rarely-seen destination from a normally narrow-scoped app
+| sort by FirstSeen asc
+| take 100
+```
+
+*Note:* No malicious domains/IPs were published for this incident, so this is a rarity/outlier heuristic on Ledger Live network egress — expect to tune against Ledger's legitimate API/cloud endpoints to avoid noise [3][5].
+
+#### New/Unexpected USB Composite Device Enumeration Prior to Crypto Wallet App Launch
+- **Actor / Campaign:** unattributed — CryptoBilis hardware implant campaign
+- **MITRE ATT&CK:** T1200 — Hardware Additions; T1195.003 — Supply Chain Compromise: Hardware Supply Chain
+- **Data source:** DeviceEvents
+- **Source:** [3],[5]
+
+```kql
+DeviceEvents
+| where TimeGenerated > ago(14d)
+| where ActionType in ("UsbDeviceConnected", "UsbDevicePlugged", "PnpDeviceConnected")
+| join kind=inner (
+    DeviceProcessEvents
+    | where FileName has_any ("ledger-live.exe", "LedgerLive.exe")
+    | project DeviceName, ProcStartTime = TimeGenerated
+) on DeviceName
+| where (ProcStartTime - TimeGenerated) between (0min .. 5min)
+| project TimeGenerated, DeviceName, ActionType, AdditionalFields, ProcStartTime
+| take 100
+```
+
+*Note:* Represents a physical hardware-implant hypothesis (extra chip/composite USB interface enumerating alongside the legitimate wallet) — this is speculative/behavioral since the report gives no technical implant details; validate field availability for USB enumeration events in your MDE/Sentinel tenant before relying on it.
+
+> [1] Yandex confirms service outage as users lose access to cloud files — https://www.bleepingcomputer.com/news/security/yandex-confirms-service-outage-as-users-lose-access-to-cloud-files/
+> [2] Anthropic takes risky AI tests offline after models breach govt sites — https://www.bleepingcomputer.com/news/security/anthropic-takes-risky-ai-tests-offline-after-models-breach-govt-sites/
+> [3] Ledger confirms spy chip implant behind wallet crypto thefts — https://www.bleepingcomputer.com/news/security/ledger-confirms-hardware-wallet-spy-implant-behind-crypto-thefts/
+> [4] Weekly Recap: Helpdesk 0-Days, Rogue Certs, ShinyHunters Arrest, AI-Fooling Malware and More — https://thehackernews.com/2026/10/weekly-recap-helpdesk-0-days-rogue.html
+> [5] Ledger Finds Unauthorized Hardware Implant in CryptoBilis-Sold Wallet Amid Fund Theft Reports — https://thehackernews.com/2026/10/ledger-finds-unauthorized-hardware.html
+> [6] Critical SonicWall SMA 1000 Flaw Targeted in 135 Exploitation Attempts After Patch — https://thehackernews.com/2026/10/critical-sonicwall-sma-1000-flaw.html
