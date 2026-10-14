@@ -10398,3 +10398,147 @@ DeviceEvents
 > [4] Weekly Recap: Helpdesk 0-Days, Rogue Certs, ShinyHunters Arrest, AI-Fooling Malware and More — https://thehackernews.com/2026/10/weekly-recap-helpdesk-0-days-rogue.html
 > [5] Ledger Finds Unauthorized Hardware Implant in CryptoBilis-Sold Wallet Amid Fund Theft Reports — https://thehackernews.com/2026/10/ledger-finds-unauthorized-hardware.html
 > [6] Critical SonicWall SMA 1000 Flaw Targeted in 135 Exploitation Attempts After Patch — https://thehackernews.com/2026/10/critical-sonicwall-sma-1000-flaw.html
+
+### 2026-10-14
+
+*Generated 2026-10-14 13:27 UTC · model `claude-sonnet-5`*
+
+_Lint: 6 KQL block(s) — query 4: unbalanced '{}'. All queries are CANDIDATES; validate before use._
+
+#### Ivanti Connect Secure exploitation indicators in appliance/CEF logs
+- **Actor / Campaign:** Unattributed (CVE-2026-104935 zero-day exploitation, reported by Volexity)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** CommonSecurityLog (CEF logs forwarded from Ivanti Connect Secure appliance)
+- **Source:** [4] [5] [7] [9]
+
+```kql
+// Hunts for authentication-bypass / root command execution patterns in CEF logs
+// forwarded from Ivanti Connect Secure gateways (CVE-2026-104935).
+// Column names/values assume a syslog->CEF forwarder; validate against your actual log schema.
+CommonSecurityLog
+| where TimeGenerated >= datetime(2026-10-01)
+| where DeviceVendor has "Ivanti" or DeviceProduct has_any ("Connect Secure", "Pulse Secure", "ICS")
+| where Activity has_any ("root", "authentication bypass", "command execution", "unauthenticated")
+    or Message has_any ("root", "bypass", "unauthenticated")
+| project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, Activity, Message
+| take 100
+```
+
+*Note:* Ivanti's Integrity Checker Tool may not detect this exploit because commands run in memory [7], so log-based detection is heuristic and depends on your syslog forwarding configuration; tune field/value names to your actual appliance log format and expect false positives from legitimate admin activity.
+
+#### Risky or anomalous sign-ins to VPN/remote-access apps following suspected ICS compromise
+- **Actor / Campaign:** Unattributed (post-exploitation credential theft via Ivanti ICS zero-day)
+- **MITRE ATT&CK:** T1078 — Valid Accounts / T1552 — Unsecured Credentials
+- **Data source:** SigninLogs
+- **Source:** [4] [7] [9]
+
+```kql
+// Looks for medium/high-risk sign-ins to VPN/remote-access-related apps since the
+// start of the exploitation window reported for CVE-2026-104935 (since ~Oct 1, 2026).
+SigninLogs
+| where TimeGenerated >= datetime(2026-10-01)
+| where ResultType == 0
+| where RiskLevelDuringSignIn in ("high", "medium")
+| where AppDisplayName has_any ("VPN", "Ivanti", "Pulse Secure", "Connect Secure")
+    or ResourceDisplayName has_any ("VPN", "Ivanti", "Pulse Secure", "Connect Secure")
+| project TimeGenerated, UserPrincipalName, IPAddress, AppDisplayName, ResourceDisplayName, RiskLevelDuringSignIn, ConditionalAccessStatus
+| take 100
+```
+
+*Note:* Credential theft was explicitly called out by CISA for this vulnerability [7]; this is a coarse correlation query intended to surface candidate sessions for forensic follow-up, not a definitive compromise indicator — tune app/resource name filters to your actual VPN integration.
+
+#### Anomalous outbound connection volume from hosts shortly after suspected ICS session (possible exfiltration)
+- **Actor / Campaign:** Unattributed (data exfiltration follow-on from Ivanti ICS compromise)
+- **MITRE ATT&CK:** T1041 — Exfiltration Over C2 Channel
+- **Data source:** DeviceNetworkEvents
+- **Source:** [7] [9]
+
+```kql
+// Flags devices with an unusually high count of distinct external destinations in a
+// short window, as a coarse proxy for data exfiltration following VPN-gateway pivoting.
+DeviceNetworkEvents
+| where Timestamp >= datetime(2026-10-01)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType == "Public"
+| summarize DistinctExternalIPs = dcount(RemoteIP), ConnCount = count() by DeviceName, bin(Timestamp, 1h)
+| where DistinctExternalIPs > 20 or ConnCount > 200
+| sort by ConnCount desc
+| take 100
+```
+
+*Note:* Pure network-volume heuristic — expect noise from backup/update jobs, proxies, and CDNs; correlate with devices known to sit behind/near the ICS gateway or with recent VPN authentications before escalating.
+
+#### Windows Shell command-injection exploitation attempt (CVE-2026-96951)
+- **Actor / Campaign:** Unattributed (actively exploited Patch Tuesday zero-day)
+- **MITRE ATT&CK:** T1059 — Command and Scripting Interpreter / T1553.005 — Mark-of-the-Web Bypass
+- **Data source:** DeviceProcessEvents
+- **Source:** [2] [8] [10]
+
+```kql
+// Behavioral hunt for shell-handler command execution that bypasses a security feature,
+// consistent with the "Windows Shell command injection / security feature bypass" KEV entry.
+// No vendor PoC/IOCs were published in source reporting, so this targets the general
+// technique class (explorer.exe/shell32 spawning interpreters with unusual command lines).
+DeviceProcessEvents
+| where Timestamp >= datetime(2026-10-13)
+| where InitiatingProcessFileName in~ ("explorer.exe", "shell32.dll", "rundll32.exe")
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "mshta.exe", "wscript.exe", "cscript.exe")
+| where ProcessCommandLine has_any ("::{", "shell:", "zone.identifier", "/c ", "-enc")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* This is purely TTP-based since no PoC details or IOCs were published for CVE-2026-96951 [2][8][10]; expect false positives from legitimate shell-extension-launched tooling and tune to your environment's baseline.
+
+#### Mark-of-the-Web / Zone.Identifier removal following file download (shell bypass follow-up)
+- **Actor / Campaign:** Unattributed (CVE-2026-96951 — Windows Shell security feature bypass)
+- **MITRE ATT&CK:** T1553.005 — Subvert Trust Controls: Mark-of-the-Web Bypass
+- **Data source:** DeviceFileEvents
+- **Source:** [2] [8] [10]
+
+```kql
+// Looks for files downloaded from the internet (would normally carry a Zone.Identifier
+// ADS) that are executed without the expected protective attribute — a common
+// post-exploitation pattern for Windows Shell MOTW/security-feature bypass issues.
+DeviceFileEvents
+| where Timestamp >= datetime(2026-10-13)
+| where ActionType == "FileCreated"
+| where FolderPath has_any (@"\Downloads\", @"\Temp\", @"\AppData\Local\Temp\")
+| where FileName endswith ".exe" or FileName endswith ".hta" or FileName endswith ".js"
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessFileName, SHA256
+| take 100
+```
+
+*Note:* Table alone can't confirm absence of Zone.Identifier (requires alternate-data-stream inspection, e.g. via DeviceEvents SmartScreen events); use this as a candidate list to cross-check with SmartScreen/AMSI telemetry for bypass confirmation.
+
+#### Unauthenticated RTSP access to exposed Swann SWIFI-SE2KIC cameras
+- **Actor / Campaign:** Unattributed (CVE-2026-107605/6/7 — missing authentication for critical function)
+- **MITRE ATT&CK:** T1040 — Network Sniffing / T1210 — Exploitation of Remote Services
+- **Data source:** DeviceNetworkEvents / CommonSecurityLog (firewall/NSG logs)
+- **Source:** [6]
+
+```kql
+// Flags inbound connections to RTSP (554) or common camera web-admin ports from
+// outside the expected local-network range, which would allow unauthenticated
+// viewing of live video on vulnerable Swann SWIFI-SE2KIC firmware <=2.0.22.
+CommonSecurityLog
+| where TimeGenerated >= ago(7d)
+| where DestinationPort in (554, 8554, 80, 8080)
+| where isnotempty(SourceIP) and isnotempty(DestinationIP)
+| where DestinationIP startswith "10." or DestinationIP startswith "192.168." // adjust to your camera VLAN
+| where not(SourceIP startswith "10." or SourceIP startswith "192.168.")
+| project TimeGenerated, SourceIP, DestinationIP, DestinationPort, DeviceAction
+| take 100
+```
+
+*Note:* This is an exposure-hunting query, not an exploitation-confirmation query — CISA's advisory notes exploitation requires only local-network access with no authentication [6], so prioritize identifying any internet-facing exposure (port-forwarded RTSP/DMZ) over log-based detection; adjust private-IP ranges to your actual camera subnet.
+
+> [1] CISA warns admins to immediately fix Ivanti flaw exploited as zero-day — https://www.bleepingcomputer.com/news/security/cisa-warns-admins-to-immediately-fix-ivanti-flaw-exploited-as-zero-day/
+> [2] Microsoft October 2026 Patch Tuesday fixes 1,411 flaws, 3 zero-days — https://www.bleepingcomputer.com/news/microsoft/microsoft-october-2026-patch-tuesday-fixes-1-411-flaws-3-zero-days/
+> [4] Attacker Chains Three Ivanti Connect Secure Zero-Days for Root Access, Only Two Patched So Far — https://thehackernews.com/2026/10/attacker-chains-three-ivanti-connect.html
+> [5] Ivanti warns of Connect Secure zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/ivanti-warns-of-connect-secure-zero-day-exploited-in-attacks/
+> [6] Swann Communications SWIFI-SE2KIC — https://www.cisa.gov/news-events/ics-advisories/icsa-26-286-02
+> [7] CISA Urges Patching Newly Exploited Vulnerability in Ivanti Connect Secure — https://www.cisa.gov/news-events/alerts/2026/10/13/cisa-urges-patching-newly-exploited-vulnerability-ivanti-connect-secure
+> [8] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/13/cisa-adds-two-known-exploited-vulnerabilities-catalog
+> [9] CVE-2026-104935 — Ivanti Connect Secure: Ivanti Connect Secure Authentication Bypass by Spoofing Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-104935
+> [10] CVE-2026-96951 — Microsoft Windows: Microsoft Windows Command Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-96951
