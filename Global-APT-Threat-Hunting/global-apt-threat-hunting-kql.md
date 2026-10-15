@@ -10542,3 +10542,227 @@ CommonSecurityLog
 > [8] CISA Adds Two Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/13/cisa-adds-two-known-exploited-vulnerabilities-catalog
 > [9] CVE-2026-104935 — Ivanti Connect Secure: Ivanti Connect Secure Authentication Bypass by Spoofing Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-104935
 > [10] CVE-2026-96951 — Microsoft Windows: Microsoft Windows Command Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-96951
+
+### 2026-10-15
+
+*Generated 2026-10-15 13:29 UTC · model `claude-sonnet-5`*
+
+_Lint: 12 KQL block(s) — query 2: unbalanced '()'. All queries are CANDIDATES; validate before use._
+
+#### Langflow Authenticated RCE Exploitation Attempts (CVE-2026-105740)
+- **Actor / Campaign:** Unattributed (mass honeypot exploitation)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [2]
+
+```kql
+// No concrete IOCs published; behavioral hunt for post-exploitation command execution
+// spawned from a Langflow/python backend process (common pattern for component/API RCE)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("python.exe", "python3", "python", "uvicorn", "gunicorn")
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "bash", "sh", "nc", "ncat", "curl", "wget")
+| where InitiatingProcessCommandLine has_any ("langflow", "flow", "component")
+       or InitiatingProcessFolderPath has "langflow"
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Langflow typically runs as a Python process — tune the parent-process name/path to match your deployment (container, service name, venv path). High FP risk if python is used broadly; scope by host group (AI/ML app servers).
+
+#### PAN-OS Management Plane Code Injection (CVE-2026-0322)
+- **Actor / Campaign:** Unattributed
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application / T1059 — Command and Scripting Interpreter
+- **Data source:** CommonSecurityLog (CEF/Syslog from PAN-OS)
+- **Source:** [3][13][17]
+
+```kql
+// PAN-OS devices typically forward CEF/syslog into CommonSecurityLog; no public IOC exists,
+// so hunt for anomalous authenticated admin actions / unexpected process execution on the mgmt plane
+CommonSecurityLog
+| where Timestamp > ago(7d)
+| where DeviceVendor == "Palo Alto Networks" and DeviceProduct has "PAN-OS"
+| where Activity has_any ("commit", "config", "debug", "system", "exec", "upload")
+| where AdditionalExtensions has_any ("cmd", "shell", "/bin/", "/tmp/")
+      or Message has_any (";", "|", "&&", "$(")
+| project TimeGenerated, DeviceName=DeviceHostName, SourceIP, DestinationIP, Activity, Message
+| take 100
+```
+
+*Note:* Requires PAN-OS syslog/CEF forwarding configured; field names vary by log forwarding profile — validate parsing before relying on `Activity`/`Message`. Prioritize review of any successful admin logins followed by unusual CLI/config commands from unexpected source IPs.
+
+#### PEERSTITCH FortiGate Implant — FGFM / Management Protocol Anomalies
+- **Actor / Campaign:** Unattributed intrusion set (Unit 42 reporting) exploiting CVE-2024-47575 (FortiManager)
+- **MITRE ATT&CK:** T1210 — Exploitation of Remote Services, T1601 — Modify System Image / Firmware, T1205.002 — Traffic Signaling
+- **Data source:** CommonSecurityLog (Fortinet syslog), DeviceNetworkEvents
+- **Source:** [4]
+
+```kql
+// Behavioral hunt: PEERSTITCH is memory-resident and ARM64-only, so no file hash IOCs are usable here.
+// Hunt for unexpected FGFM (TCP/541) management-protocol connections to/from FortiGate devices,
+// which attackers abuse post FortiManager (CVE-2024-47575) compromise to register rogue devices.
+CommonSecurityLog
+| where Timestamp > ago(14d)
+| where DeviceVendor == "Fortinet"
+| where DestinationPort == 541 or SourcePort == 541
+| where isnotempty(SourceIP) and isnotempty(DestinationIP)
+| summarize ConnCount=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated) by SourceIP, DestinationIP, DeviceName=DeviceHostName
+| where ConnCount > 5
+| take 100
+```
+
+*Note:* Highly environment-dependent heuristic — legitimate FortiManager-to-FortiGate FGFM traffic is normal; focus on connections from unexpected/external source IPs or newly-seen device pairs following the CVE-2024-47575 exploitation window.
+
+#### DPRK IT Worker / Laptop Farm Indicators — Shared Remote-Access Infrastructure
+- **Actor / Campaign:** Famous Chollima (DPRK remote IT worker scheme)
+- **MITRE ATT&CK:** T1078 — Valid Accounts, T1219 — Remote Access Software, T1584 — Compromise Infrastructure
+- **Data source:** SigninLogs, DeviceProcessEvents
+- **Source:** [5][9]
+
+```kql
+// Hunt for hallmark "laptop farm" pattern: KVM-over-IP / remote software enabling one physical
+// device to be used by, or to proxy, multiple distinct corporate identities.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName has_any ("anydesk.exe", "teamviewer.exe", "chromeremotedesktop", "rustdesk.exe", "ultraviewer.exe", "tightvnc.exe")
+| summarize Accounts=make_set(AccountName), DeviceCount=dcount(DeviceName) by DeviceId=DeviceName
+| where array_length(Accounts) > 2
+| take 100
+```
+
+```kql
+// Companion identity hunt: many distinct accounts authenticating from the same device/IP,
+// a pattern associated with KVM-switch "laptop farms" used by overseas facilitators.
+SigninLogs
+| where TimeGenerated > ago(14d)
+| summarize DistinctUsers=dcount(UserPrincipalName), Users=make_set(UserPrincipalName) by IPAddress, DeviceDetail=tostring(DeviceDetail.deviceId)
+| where DistinctUsers >= 3
+| take 100
+```
+
+*Note:* Pair with HR onboarding data and ensure the host device inventory maps 1:1 to employees; legitimate shared kiosk/VDI hosts will cause FPs — tune by excluding known shared infrastructure.
+
+#### Webshell Drop via Nextcloud Collabora "Built-in CODE" App
+- **Actor / Campaign:** Unattributed
+- **MITRE ATT&CK:** T1505.003 — Web Shell, T1190 — Exploit Public-Facing Application
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [6]
+
+```kql
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FolderPath has_any ("nextcloud", "richdocumentscode", "richdocuments")
+| where FileName endswith ".php"
+| where InitiatingProcessFileName has_any ("php", "php-fpm", "apache2", "httpd", "nginx", "w3wp.exe")
+| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessAccountName
+| take 100
+```
+
+```kql
+// Companion: web server process spawning a shell is a strong webshell indicator
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("php", "php-fpm", "apache2", "httpd", "nginx", "w3wp.exe")
+| where FileName in~ ("cmd.exe", "powershell.exe", "bash", "sh", "whoami", "id", "wget", "curl")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| take 100
+```
+
+*Note:* First reported attacks began 2026-09-10 per GitHub reports — backfill at least 30 days. Review any newly written `.php` files in Nextcloud app directories not matching your deployment's known app versions.
+
+#### Cisco Secure Email Gateway Path Traversal / Arbitrary File Write (CVE-2026-76519)
+- **Actor / Campaign:** Unattributed
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application, T1083 — File and Directory Discovery
+- **Data source:** CommonSecurityLog (Cisco ESA/SEG syslog)
+- **Source:** [7][13][15]
+
+```kql
+// No public IOCs; hunt for path-traversal patterns ("../") in requests/log entries to the SEG
+CommonSecurityLog
+| where TimeGenerated > ago(14d)
+| where DeviceVendor has "Cisco" and DeviceProduct has_any ("Secure Email", "IronPort", "ESA")
+| where RequestURL has "../" or Message has "../" or FileName has "../"
+| project TimeGenerated, DeviceName=DeviceHostName, SourceIP, RequestURL, Message
+| take 100
+```
+
+*Note:* Validate that SEG is forwarding admin/web interface access logs into Sentinel; this is a KEV-listed, unauthenticated, root-privilege vulnerability — treat any traversal hit on internet-facing SEG appliances as high priority.
+
+#### Phishing Kit Infrastructure (CoGUI / Haozi / Iron Man System — Storm-2990/Storm-3119)
+- **Actor / Campaign:** Storm-2990 (phishing kit operators) / Storm-3119 (marketplace)
+- **MITRE ATT&CK:** T1566.002 — Phishing: Spearphishing Link, T1583.001 — Acquire Infrastructure: Domains
+- **Data source:** EmailEvents, EmailUrlInfo, ThreatIntelligenceIndicator
+- **Source:** [8][11]
+
+```kql
+// Behavioral hunt pending IOC enrichment: these kits power high-volume brand-impersonation
+// smishing/phishing with randomized redirect domains — look for mass delivery of near-identical
+// subject/sender patterns followed by click-through to newly-seen domains.
+EmailEvents
+| where Timestamp > ago(7d)
+| where DeliveryAction == "Delivered"
+| summarize RecipientCount=dcount(RecipientEmailAddress), Subjects=make_set(Subject,5) by SenderFromDomain, bin(Timestamp, 1h)
+| where RecipientCount > 50
+| join kind=inner (
+    EmailUrlInfo
+    | where Timestamp > ago(7d)
+) on $left.NetworkMessageId == $right.NetworkMessageId
+| project Timestamp, SenderFromDomain, RecipientCount, Url, UrlDomain
+| take 100
+```
+
+```kql
+// Match against TI indicators if Microsoft/partners publish Storm-2990/3119 IOCs to your feed
+ThreatIntelligenceIndicator
+| where TimeGenerated > ago(14d)
+| where Description has_any ("Storm-2990", "Storm-3119", "CoGUI", "Haozi", "Iron Man System")
+| join kind=inner (EmailUrlInfo | where Timestamp > ago(14d)) on $left.NetworkSource == $right.UrlDomain
+| take 100
+```
+
+*Note:* No specific domains/hashes were published in the source — this is purely behavioral/volume-based; tune the recipient-count threshold to your mail volume and cross-check against brand-impersonation allow-lists to cut FPs.
+
+#### Ivanti Connect Secure Zero-Day & Ahsay AhsayCBS Auth-Bypass/Command-Injection Chain
+- **Actor / Campaign:** Unattributed (active zero-day exploitation; chained CVE-2026-105133/105134)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application, T1078 — Valid Accounts (auth bypass), T1059 — Command and Scripting Interpreter
+- **Data source:** CommonSecurityLog (ICS/VPN appliance syslog), W3CIISLog / CommonSecurityLog (AhsayCBS web logs)
+- **Source:** [12][13][14][16]
+
+```kql
+// Ivanti Connect Secure: no public IOC yet; hunt for anomalous authentication/session activity
+// on ICS appliances since the reported start of exploitation (2026-10-01)
+CommonSecurityLog
+| where TimeGenerated > datetime(2026-10-01)
+| where DeviceVendor has "Ivanti" or DeviceProduct has_any ("Connect Secure", "Pulse Secure")
+| where Activity has_any ("login", "auth", "session") 
+| summarize Attempts=count() by SourceIP, DestinationIP, DeviceName=DeviceHostName, bin(TimeGenerated, 1h)
+| where Attempts > 20
+| take 100
+```
+
+```kql
+// AhsayCBS: target the specifically named vulnerable endpoint/parameter from the advisory
+CommonSecurityLog
+| where TimeGenerated > ago(30d)
+| where RequestURL has "UpdateReceivers.do" or RequestURL has "checkSysPwd"
+| project TimeGenerated, DeviceName=DeviceHostName, SourceIP, RequestURL, RequestMethod
+| take 100
+```
+
+*Note:* Both appliances are typically monitored via syslog/CEF rather than Defender EDR tables — confirm log forwarding is enabled before relying on these queries. Any hit on the AhsayCBS endpoint pattern combined with unusual `random` parameter values warrants immediate investigation per CISA KEV guidance.
+
+> [2] Langflow's Critical Authenticated RCE Flaw Targeted in 1,423 Honeypot Exploit Attempts — https://thehackernews.com/2026/10/langflows-critical-authenticated-rce.html
+> [3] Palo Alto Networks warns of PAN-OS RCE flaw exploited in attacks — https://www.bleepingcomputer.com/news/security/palo-alto-networks-warns-of-pan-os-rce-flaw-exploited-in-attacks/
+> [4] Unit 42 Uncovers PEERSTITCH, a Stealthy FortiGate Implant — https://unit42.paloaltonetworks.com/fortimanager-cve-2024-47575-peerstitch-malware/
+> [5] FBI raids DPRK IT worker laptop farms in Texas, US nationals arrested — https://www.bleepingcomputer.com/news/security/fbi-raids-dprk-it-worker-laptop-farms-in-texas-us-nationals-arrested/
+> [6] Hackers Backdoor Nextcloud Servers Through Critical Flaw in Collabora's Built-in CODE App — https://thehackernews.com/2026/10/hackers-backdoor-nextcloud-servers.html
+> [7] Cisco patches new Secure Email Gateway zero-day exploited in attacks — https://www.bleepingcomputer.com/news/security/cisco-patches-actively-exploited-secure-email-gateway-zero-day/
+> [8] Microsoft Disrupts 3 Phishing Kits Linked to Over 1 Billion Scam Messages — https://thehackernews.com/2026/10/microsoft-disrupts-3-phishing-kits.html
+> [9] U.S. Shuts Down Over 40 Laptop Farms, Charges 14 in North Korean IT Worker Fraud — https://thehackernews.com/2026/10/us-shuts-down-over-40-laptop-farms.html
+> [11] The hidden network: Inside the phishing infrastructure ecosystem powering global cybercrime — https://www.microsoft.com/en-us/security/blog/2026/10/14/the-hidden-network-inside-the-phishing-infrastructure-ecosystem-powering-global-cybercrime/
+> [12] CISA warns admins to immediately fix Ivanti flaw exploited as zero-day — https://www.bleepingcomputer.com/news/security/cisa-warns-admins-to-immediately-fix-ivanti-flaw-exploited-as-zero-day/
+> [13] CISA Adds Four Known Exploited Vulnerabilities to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/14/cisa-adds-four-known-exploited-vulnerabilities-catalog
+> [14] CVE-2026-105134 — Ahsay AhsayCBS: Command Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-105134
+> [15] CVE-2026-76519 — Cisco Secure Email Gateway: Relative Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-76519
+> [16] CVE-2026-105133 — Ahsay AhsayCBS: Improper Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-105133
+> [17] CVE-2026-0322 — Palo Alto Networks PAN-OS: Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-0322
