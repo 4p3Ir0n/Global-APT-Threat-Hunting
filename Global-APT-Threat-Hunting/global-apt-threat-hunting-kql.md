@@ -10766,3 +10766,183 @@ CommonSecurityLog
 > [15] CVE-2026-76519 — Cisco Secure Email Gateway: Relative Path Traversal Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-76519
 > [16] CVE-2026-105133 — Ahsay AhsayCBS: Improper Authentication Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-105133
 > [17] CVE-2026-0322 — Palo Alto Networks PAN-OS: Code Injection Vulnerability — https://nvd.nist.gov/vuln/detail/CVE-2026-0322
+
+### 2026-10-16
+
+*Generated 2026-10-16 13:28 UTC · model `claude-sonnet-5`*
+
+_Lint: 8 KQL block(s) — structural checks passed. All queries are CANDIDATES; validate before use._
+
+#### BeyondTrust Remote Support Zero-Day Exploitation (Armory Castle / UNC5221)
+- **Actor / Campaign:** Armory Castle (formerly UNC5221 / Warp Panda)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1059 — Command and Scripting Interpreter
+- **Data source:** DeviceProcessEvents
+- **Source:** [2][3]
+
+```kql
+// Hunt for suspicious child processes spawned by BeyondTrust Remote Support (formerly Bomgar) components
+// following exploitation of CVE-2026-102764 (improper origin validation in internal messaging component)
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where InitiatingProcessFileName has_any ("bomgar", "BeyondTrustRS", "btrs", "bomgar-scc", "bomgar-pac")
+    or InitiatingProcessFolderPath has "BeyondTrust"
+| where FileName in~ ("cmd.exe","powershell.exe","powershell_ise.exe","wscript.exe","cscript.exe","rundll32.exe","mshta.exe","certutil.exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* BeyondTrust jump clients/services can legitimately spawn scripts during support sessions; baseline normal admin usage first and correlate with internet-facing RS server network activity before escalating.
+
+#### FortiOS CLI Path Traversal Leading to PEERSTITCH Implant
+- **Actor / Campaign:** unattributed (suspected advanced threat actor)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1059.008 — Network Device CLI
+- **Data source:** CommonSecurityLog (Fortinet CEF/syslog ingestion)
+- **Source:** [4]
+
+```kql
+// Behavioral hunt for CLI path-traversal patterns against FortiOS/FortiPAM/FortiProxy/FortiSwitchManager
+// exploiting CVE-2025-61624 (path traversal in CLI interpreter) that bypasses tagged VPN session checks
+CommonSecurityLog
+| where TimeGenerated > ago(60d)
+| where DeviceVendor =~ "Fortinet"
+| where Message has_any ("../", "..\\", "execute") 
+    and Message has_any ("cli", "ssl-vpn", "tunnel")
+| project TimeGenerated, DeviceProduct, DeviceAction, SourceIP, DestinationIP, Message
+| take 100
+```
+
+*Note:* No file/process IOCs for PEERSTITCH (ARM64, memory-resident) exist yet; this is a coarse behavioral query on raw Fortinet logs and will need tuning to the specific log fields your Fortinet syslog connector populates.
+
+#### Linux Webshell / Credential-Theft Activity (AI-Linked Espionage Campaign)
+- **Actor / Campaign:** unattributed AI-powered espionage campaign (Unit 42)
+- **MITRE ATT&CK:** T1505.003 — Web Shell; T1552.001 — Credentials In Files
+- **Data source:** DeviceFileEvents, DeviceProcessEvents
+- **Source:** [5]
+
+```kql
+// Hunt for web shell drops and credential harvesting on Linux government infrastructure
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FolderPath has_any ("/var/www", "/srv/http", "/usr/share/nginx")
+| where FileName endswith_cs ".php" or FileName endswith_cs ".jsp" or FileName endswith_cs ".asp"
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has_any ("/etc/shadow", "id_rsa", ".ssh/authorized_keys", "cat /etc/passwd")
+) on DeviceId
+| project Timestamp, DeviceName, FileName, FolderPath, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Behavioral/TTP-based only — no concrete file names or hashes were published; expect noise from legitimate deployment scripts and tune to known web-app directories in your environment.
+
+#### Collabora/Nextcloud RCE Leading to Web Shell (CVE-2026-110447)
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1505.003 — Web Shell
+- **Data source:** DeviceProcessEvents, DeviceFileEvents
+- **Source:** [6]
+
+```kql
+// Detect shell spawned by Collabora CODE (richdocumentscode) / Nextcloud web process following CVE-2026-110447
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("php-fpm","coolwsd","loolwsd","www-data") 
+    or InitiatingProcessFolderPath has_any ("nextcloud","richdocumentscode","collabora")
+| where FileName in~ ("sh","bash","dash","nc","curl","wget","python3")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessFolderPath, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Confirm the Collabora/richdocumentscode process names used in your deployment (container vs. bare-metal) before enabling broadly; legitimate conversion jobs can spawn subprocesses.
+
+#### Fake AUR Package (yay/paru Impersonation) Root Compromise
+- **Actor / Campaign:** unattributed
+- **MITRE ATT&CK:** T1195.001 — Compromise Software Supply Chain; T1548 — Abuse Elevation Control Mechanism
+- **Data source:** DeviceProcessEvents (Linux)
+- **Source:** [9]
+
+```kql
+// Hunt for AUR build processes (makepkg) spawning network or privilege-escalation activity
+// following install of malicious packages impersonating yay/paru
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("makepkg","pacman")
+| where FileName in~ ("curl","wget","sudo","bash","sh") 
+| where ProcessCommandLine has_any ("sudoers", "chmod 4755", "setuid", "/etc/passwd")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* AUR helpers legitimately invoke makepkg/pacman and network tools during normal builds; this query is heuristic and best used for post-incident retro-hunting on hosts known to use AUR.
+
+#### Silent Lynx Multi-Chain Infection (Macro, PS2EXE, GitHub PowerShell, WinRAR Exploit)
+- **Actor / Campaign:** Silent Lynx
+- **MITRE ATT&CK:** T1566.001 — Phishing: Spearphishing Attachment; T1204.002 — User Execution: Malicious File; T1059.001 — PowerShell
+- **Data source:** DeviceProcessEvents, DeviceNetworkEvents
+- **Source:** [10]
+
+```kql
+// Multi-pronged hunt for Silent Lynx infection chains against CIS government targets:
+// Office macro -> script, WinRAR exploit -> reverse shell, PS2EXE downloader, GitHub-hosted PowerShell
+DeviceProcessEvents
+| where Timestamp > ago(90d)
+| where (InitiatingProcessFileName in~ ("winword.exe","excel.exe","powerpnt.exe") 
+            and FileName in~ ("powershell.exe","wscript.exe","cscript.exe","cmd.exe"))
+    or (InitiatingProcessFileName in~ ("winrar.exe","rar.exe") and FileName in~ ("powershell.exe","cmd.exe"))
+    or (ProcessCommandLine has "raw.githubusercontent.com")
+    or (FileName has "PS2EXE" or ProcessCommandLine has "ps2exe")
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName, ProcessCommandLine, AccountName
+| take 100
+```
+
+*Note:* Combines several loosely-coupled behavioral signals from the reported infection chains; validate each hit individually since WinRAR/PowerShell/macro chains are also common in legitimate IT automation.
+
+#### Atlassian Data Center External File Exposure (CVE-2026-21589, KEV)
+- **Actor / Campaign:** unattributed (actively exploited, added to CISA KEV)
+- **MITRE ATT&CK:** T1190 — Exploit Public-Facing Application; T1552 — Unsecured Credentials
+- **Data source:** CommonSecurityLog / Syslog (reverse proxy or WAF logs ingested for Atlassian Data Center apps)
+- **Source:** [14][15]
+
+```kql
+// Hunt for unauthenticated external access to files/directories within Atlassian Data Center web app root
+// (Bitbucket, Confluence, Jira SM/Software, Bamboo, Crowd, Crucible, Fisheye) - CVE-2026-21589
+CommonSecurityLog
+| where TimeGenerated > ago(30d)
+| where DeviceProduct has_any ("Confluence","Jira","Bitbucket","Bamboo","Crowd","Crucible","Fisheye")
+| where RequestURL has_any ("WEB-INF", ".xml", ".properties", ".cfg", "/conf/", "/..;/")
+| where DestinationPort in (80,443,8080,8443)
+| project TimeGenerated, SourceIP, DestinationIP, RequestURL, DeviceAction, DeviceProduct
+| take 100
+```
+
+*Note:* Query assumes Atlassian access/reverse-proxy logs are forwarded via a CEF/syslog connector; no confirmed malicious URI paths were published, so this is a TTP-based filter on common sensitive-file access patterns and requires tuning to your proxy's log schema.
+
+#### dcm4che DICOM Storage Status Manipulation (Potential PACS Record Tampering)
+- **Actor / Campaign:** unattributed (vulnerability disclosure, no known exploitation reported)
+- **MITRE ATT&CK:** T1565 — Data Manipulation; T1499 — Endpoint Denial of Service
+- **Data source:** Custom application logs (dcm4chee-arc-light REST API) ingested via Sentinel Data Collector / Syslog
+- **Source:** [13]
+
+```kql
+// Speculative hunt for abuse of unauthenticated storage status-change REST calls in dcm4chee-arc-light
+// (CVE-2026-97851) that can trigger premature deletion of DICOM instances
+Syslog
+| where TimeGenerated > ago(30d)
+| where ProcessName has "dcm4chee" or SyslogMessage has "dcm4chee"
+| where SyslogMessage has_any ("TO_DELETE", "storage status", "PurgeStorageScheduler")
+| project TimeGenerated, Computer, SyslogMessage
+| take 100
+```
+
+*Note:* No EDR-visible telemetry exists for this application-layer vulnerability; this query assumes dcm4chee application logs are forwarded to Sentinel and should be validated against your actual log format — patch to 5.35.2+ is the primary remediation, not detection.
+
+> [2] China-Linked Hackers Exploited BeyondTrust Zero-Day to Take Over Remote Support Servers — https://thehackernews.com/2026/10/china-linked-hackers-exploited.html
+> [3] BeyondTrust patches zero-day exploited in attacks since August — https://www.bleepingcomputer.com/news/security/beyondtrust-patches-zero-day-exploited-in-attacks-since-august/
+> [4] PEERSTITCH Malware Deployed via FortiOS Flaw Bypasses Checks on Tagged VPN Sessions — https://thehackernews.com/2026/10/attackers-exploit-fortios-flaw-to.html
+> [5] AI-Powered Espionage Campaign Targets Government Linux Infrastructure — https://unit42.paloaltonetworks.com/ai-campaign-targets-linux-infrastructure/
+> [6] Hackers exploit Collabora RCE flaw to backdoor Nextcloud servers — https://www.bleepingcomputer.com/news/security/hackers-exploit-collabora-rce-flaw-to-backdoor-nextcloud-servers/
+> [9] Fake Arch Linux packages push malware with root privileges — https://www.bleepingcomputer.com/news/security/fake-arch-linux-packages-push-malware-with-root-privileges/
+> [10] Silent Lynx Exploits WinRAR Flaw to Deploy Reverse Shell in CIS Government Attacks — https://thehackernews.com/2026/10/silent-lynx-exploits-winrar-flaw-to.html
+> [13] J4Care dcm4che — https://www.cisa.gov/news-events/ics-medical-advisories/icsma-26-288-02
+> [14] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/15/cisa-adds-one-known-exploited-vulnerability-catalog
+> [15] CVE-2026-21589 — Atlassian Multiple Products — https://nvd.nist.gov/vuln/detail/CVE-2026-21589
