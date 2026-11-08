@@ -10946,3 +10946,11 @@ Syslog
 > [13] J4Care dcm4che — https://www.cisa.gov/news-events/ics-medical-advisories/icsma-26-288-02
 > [14] CISA Adds One Known Exploited Vulnerability to Catalog — https://www.cisa.gov/news-events/alerts/2026/10/15/cisa-adds-one-known-exploited-vulnerability-catalog
 > [15] CVE-2026-21589 — Atlassian Multiple Products — https://nvd.nist.gov/vuln/detail/CVE-2026-21589
+
+### 2026-11-08
+
+*Generated 2026-11-08 13:18 UTC · model `claude-sonnet-5`*
+
+_Lint: no KQL blocks detected._
+
+_No APT-relevant open-source items in the collection window; no detections generated._
